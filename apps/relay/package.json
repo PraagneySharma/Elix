@@ -1,0 +1,31 @@
+{
+  "name": "@elix/relay",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "dev": "node --env-file-if-exists=../../.env --import tsx src/index.ts",
+    "prebuild": "node ../../scripts/build-docs.mjs",
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test src/*.test.ts",
+    "start": "node --env-file-if-exists=../../.env dist/src/index.js",
+    "migrate": "node --env-file-if-exists=../../.env dist/src/migrate.js",
+    "stats": "node --env-file-if-exists=../../.env dist/src/stats.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@elix/protocol": "*",
+    "express": "5.2.1",
+    "jose": "6.2.3",
+    "pg": "8.16.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.5",
+    "@types/node": "22.20.1",
+    "@types/pg": "8.15.5",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "elix": {
+      "type": "streamable-http",
+      "url": "https://mcp.praagney.com/mcp",
+      "extensions": {
+        "com.openai": {
+          "auth": {
+            "type": "oauth",
+            "client": {
+              "mode": "provided",
+              "clientId": "CthsztBpCdiDgT0rAPiGeHy5MnSFtIir",
+              "tokenEndpointAuthMethod": "none"
+            },
+            "baseScopes": [
+              "veronica:access"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

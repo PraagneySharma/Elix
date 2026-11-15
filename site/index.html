@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="When Codex runs out, use the ChatGPT access you still have to work on the project on your computer with Elix."
+    />
+    <meta name="theme-color" content="#050506" />
+    <title>Elix</title>
+    <link rel="icon" href="/elix-logo.svg?v=elix-2" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-192.png?v=elix-2" type="image/png" sizes="192x192" />
+    <link rel="shortcut icon" href="/favicon.ico?v=elix-2" type="image/x-icon" />
+    <link rel="stylesheet" href="/styles.css?v=45" />
+  </head>
+  <body class="landing-shell">
+    <header class="site-header page-width">
+      <a class="brand" href="/" aria-label="Elix home">
+        <img class="brand-symbol" src="/elix-logo.svg?v=elix-2" alt="" />
+        <span>Elix</span>
+      </a>
+      <nav class="header-links" aria-label="Site navigation">
+        <a href="/docs/quickstart">Quickstart</a>
+        <a href="/panel">Control panel</a>
+        <a href="/security">Security</a>
+        <a href="/support">Support</a>
+        <a href="https://github.com/PraagneySharma/Elix">GitHub</a>
+      </nav>
+    </header>
+
+    <main class="landing-main page-width">
+      <section class="landing-hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h1 id="hero-title">Codex ran out. <span>Keep going with ChatGPT.</span></h1>
+          <p class="hero-summary">Elix is available on npm. ChatGPT access is currently limited to approved beta testers while the sign-in and pairing flow is validated.</p>
+          <div class="hero-action-row">
+            <a class="primary-action" href="/docs/quickstart">Get started with Elix</a>
+          </div>
+          <div class="hero-installer">
+            <div class="hero-installer-heading">
+              <span>Install the CLI with npm, then start it inside your project</span>
+            </div>
+            <div class="hero-install-panel">
+              <div class="code-block hero-code-block">
+                <button
+                  class="copy-button"
+                  type="button"
+                  aria-label="Copy Elix install and start commands"
+                  data-copy-target="hero-install-npm"
+                ><span class="copy-tooltip" aria-hidden="true">Copy</span></button>
+                <pre><code id="hero-install-npm">npm install -g @praagney/elix
+elix --access read-only --label elix</code></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="site-footer-inner page-width">
+        <span>Need help? <a href="/support">Visit support.</a></span>
+        <nav aria-label="Legal and support">
+          <a href="/security">Security</a>
+          <a href="/privacy">Privacy</a>
+          <a href="/terms">Terms</a>
+          <a href="/support">Support</a>
+          <a href="/panel">Control panel</a>
+        </nav>
+      </div>
+    </footer>
+    <script type="module" src="/copy.js"></script>
+  </body>
+</html>

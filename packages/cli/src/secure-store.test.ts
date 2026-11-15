@@ -1,0 +1,248 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { SecureStore } from "./secure-store.js";
+
+async function withTempFile(run: (file: string) => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "elix-secure-store-"));
+  try {
+    await run(path.join(dir, "credentials.json"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("treats an unparseable keyring value as absent instead of throwing", async () => {
+  await withTempFile(async (file) => {
+    const store = new SecureStore<{ token: string }>({
+      account: "oauth",
+      file,
+      warning: "warned",
+      parse: (serialized) => {
+        const value = JSON.parse(serialized);
+        if (typeof value !== "object" || value === null) {
+          throw new Error("Stored credentials are invalid.");
+        }
+        return value;
+      },
+      warn: () => {},
+      entryProvider: async () => ({
+        getSecret: async () => new TextEncoder().encode("null"),
+        setSecret: async () => {},
+        deleteCredential: async () => true,
+      }),
+    });
+
+    assert.equal(await store.load(), null);
+  });
+});
+
+test("falls back to the file when the keyring entry is unparseable", async () => {
+  await withTempFile(async (file) => {
+    const value = { token: "file-secret" };
+    await writeFile(file, JSON.stringify(value), "utf8");
+    const store = new SecureStore<{ token: string }>({
+      account: "oauth",
+      file,
+      warning: "warned",
+      parse: (serialized) => {
+        const parsed = JSON.parse(serialized);
+        if (typeof parsed !== "object" || parsed === null) {
+          throw new Error("Stored credentials are invalid.");
+        }
+        return parsed;
+      },
+      warn: () => {},
+      entryProvider: async () => ({
+        getSecret: async () => new TextEncoder().encode("corrupt"),
+        setSecret: async () => {},
+        deleteCredential: async () => true,
+      }),
+    });
+
+    assert.deepEqual(await store.load(), { value, backend: "file" });
+  });
+});
+
+test("still loads valid keyring credentials", async () => {
+  await withTempFile(async (file) => {
+    const serialized = JSON.stringify({ token: "abc" });
+    const store = new SecureStore<{ token: string }>({
+      account: "oauth",
+      file,
+      warning: "warned",
+      parse: (serialized) => JSON.parse(serialized) as { token: string },
+      warn: () => {},
+      entryProvider: async () => ({
+        getSecret: async () => Array.from(new TextEncoder().encode(serialized)),
+        setSecret: async () => {},
+        deleteCredential: async () => true,
+      }),
+    });
+
+    const loaded = await store.load();
+
+    assert.deepEqual(loaded, { value: { token: "abc" }, backend: "keyring" });
+  });
+});
+
+test("treats a missing native credential as empty", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "elix-secure-store-"));
+  t.after(async () => await rm(root, { recursive: true, force: true }));
+  const warnings: string[] = [];
+  const store = new SecureStore<string>({
+    account: "oauth",
+    file: path.join(root, "credentials.json"),
+    warning: "file fallback",
+    parse: (serialized) => serialized,
+    warn: (message) => warnings.push(message),
+    entryProvider: async () => ({
+      setSecret: async () => undefined,
+      getSecret: async () => null,
+      deleteCredential: async () => false,
+    }),
+  });
+
+  assert.equal(await store.load(), null);
+  await store.delete();
+  assert.deepEqual(warnings, []);
+});
+
+test("reports failed native credential deletion", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "elix-secure-store-"));
+  t.after(async () => await rm(root, { recursive: true, force: true }));
+  const file = path.join(root, "credentials.json");
+  await writeFile(file, "fallback-secret", "utf8");
+  const store = new SecureStore<string>({
+    account: "oauth",
+    file,
+    warning: "file fallback",
+    parse: (serialized) => serialized,
+    entryProvider: async () => ({
+      setSecret: async () => undefined,
+      getSecret: async () => new TextEncoder().encode("oauth-secret"),
+      deleteCredential: async () => false,
+    }),
+  });
+
+  await assert.rejects(
+    store.delete(),
+    /credential store could not remove the Elix credential/,
+  );
+  assert.equal((await store.load())?.value, "oauth-secret");
+  await assert.rejects(readFile(file), { code: "ENOENT" });
+});
+
+test("loading a file credential never writes to the keyring", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "elix-secure-store-"));
+  t.after(async () => await rm(root, { recursive: true, force: true }));
+  const file = path.join(root, "credentials.json");
+  await writeFile(file, JSON.stringify({ token: "file-secret" }), "utf8");
+  let setSecretCalls = 0;
+  const store = new SecureStore<{ token: string }>({
+    account: "oauth",
+    file,
+    warning: "file fallback",
+    parse: (serialized) => JSON.parse(serialized) as { token: string },
+    warn: () => {},
+    entryProvider: async () => ({
+      getSecret: async () => null,
+      setSecret: async () => {
+        setSecretCalls += 1;
+      },
+      deleteCredential: async () => true,
+    }),
+  });
+
+  const loaded = await store.load();
+
+  assert.deepEqual(loaded, { value: { token: "file-secret" }, backend: "file" });
+  assert.equal(setSecretCalls, 0);
+  assert.equal(await readFile(file, "utf8"), JSON.stringify({ token: "file-secret" }));
+});
+
+test("stores a Windows-sized OAuth credential as bytes", async () => {
+  await withTempFile(async (file) => {
+    const value = { token: "x".repeat(1_327) };
+    let stored: Uint8Array | undefined;
+    const warnings: string[] = [];
+    const store = new SecureStore<typeof value>({
+      account: "oauth",
+      file,
+      warning: "file fallback",
+      parse: (serialized) => JSON.parse(serialized) as typeof value,
+      warn: (message) => warnings.push(message),
+      entryProvider: async () => ({
+        getSecret: async () => stored,
+        setSecret: async (secret) => {
+          stored = secret;
+        },
+        deleteCredential: async () => true,
+      }),
+    });
+
+    assert.ok(Buffer.byteLength(JSON.stringify(value), "utf16le") > 2_560);
+    assert.equal(await store.save(value), "keyring");
+    assert.equal(stored?.byteLength, JSON.stringify(value).length);
+    assert.deepEqual(await store.load(), { value, backend: "keyring" });
+    assert.deepEqual(warnings, []);
+    await assert.rejects(readFile(file), { code: "ENOENT" });
+  });
+});
+
+test("warns only once while reusing a file fallback", async () => {
+  await withTempFile(async (file) => {
+    const value = { token: "file-secret" };
+    await writeFile(file, JSON.stringify(value), "utf8");
+    const warnings: string[] = [];
+    const store = new SecureStore<typeof value>({
+      account: "oauth",
+      file,
+      warning: "file fallback",
+      parse: (serialized) => JSON.parse(serialized) as typeof value,
+      warn: (message) => warnings.push(message),
+      entryProvider: async () => ({
+        getSecret: async () => null,
+        setSecret: async () => {
+          throw new Error("credential store unavailable");
+        },
+        deleteCredential: async () => false,
+      }),
+    });
+
+    assert.deepEqual(await store.load(), { value, backend: "file" });
+    assert.deepEqual(await store.load(), { value, backend: "file" });
+    assert.deepEqual(warnings, ["file fallback"]);
+  });
+});
+
+test(
+  "round-trips the native operating-system credential store",
+  { skip: process.env.ELIX_TEST_NATIVE_KEYRING !== "1" },
+  async (context) => {
+    await withTempFile(async (file) => {
+      const value = { token: `integration-${randomUUID()}` };
+      const warnings: string[] = [];
+      const store = new SecureStore<typeof value>({
+        account: `integration-${randomUUID()}`,
+        file,
+        warning: "file fallback",
+        parse: (serialized) => JSON.parse(serialized) as typeof value,
+        warn: (message) => warnings.push(message),
+      });
+      context.after(async () => {
+        await store.delete();
+      });
+
+      assert.equal(await store.save(value), "keyring");
+      assert.deepEqual(await store.load(), { value, backend: "keyring" });
+      assert.deepEqual(warnings, []);
+
+      await store.delete();
+      assert.equal(await store.load(), null);
+    });
+  },
+);

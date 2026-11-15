@@ -1,0 +1,259 @@
+# Core security and threat model
+
+How Elix protects local workspaces, accounts, credentials, and data.
+
+## Security boundary
+
+Each worker exposes one canonical local directory and one access profile:
+
+| Profile | Structured reads | Guarded mutations inside root | Commands |
+| --- | --- | --- | --- |
+| `read-only` | Yes | No | No |
+| `workspace` (default) | Yes | Yes | No |
+| `system` | Yes | Yes | Yes |
+
+The selected profile is visible in the local terminal and returned by `list_workspaces` as both a profile and exact permission booleans. The relay rejects an operation outside that profile before queueing it. The local worker independently performs the same check before reading, writing, or starting a process. This defense in depth protects against relay mistakes, stale clients, protocol skew, and attempted bypasses through direct worker traffic.
+
+## Warning about system access
+
+`system` access is explicit remote command authority for the operating-system account that launched Elix. A command inherits that process's complete environment, credentials, filesystem permissions, and network access. It starts in the exposed root but is not confined there. File-tool containment does not sandbox commands, and command filtering is not presented as a security boundary.
+
+Use the default `workspace` profile when file changes, directory creation, deletion, or moves inside the exposed root are sufficient. Enable `system` only when the requested task genuinely requires the local toolchain. Use a dedicated operating-system account, container, or virtual machine when stronger isolation is required.
+
+## Trust assumptions
+
+- The Elix operator controls the hosted relay and identity provider.
+- The authenticated user intends to authorize the connected MCP client.
+- The local computer and selected operating-system account are trusted for the chosen profile.
+- There is no hostile multi-tenant execution inside one local worker process.
+- TLS termination, OAuth token validation, and deployment secrets are correctly configured.
+- The user understands that `system` is broader than the exposed file root.
+
+## Primary assets
+
+- Local source code and project data.
+- Local developer credentials, environment, tools, and network identity.
+- Device credentials and ephemeral worker credentials.
+- OAuth refresh and access tokens.
+- Account, device, worker, and job ownership relationships.
+- Command details, command results, and file contents in transit.
+
+## Primary threats and controls
+
+### Cross-account routing
+
+**Threat:** an authenticated account guesses another account's device, worker, command, or job identifier.
+
+**Controls:**
+
+- include `account_id` in all primary and foreign-key relationships;
+- validate JWT signature, issuer, audience, expiry, required scope, and explicit Auth0 provider-prefix and exact-subject allowlists;
+- require account ID in every database and in-memory ownership lookup;
+- never fetch by resource ID and check ownership afterward when an account-scoped query is possible;
+- use opaque random identifiers;
+- require a single-use, short-lived pairing code claimed through an authenticated control-panel session before enrolling each new computer;
+- bind ephemeral worker credentials to one account, device, worker ID, and generation;
+- verify account isolation with direct integration checks before deployment.
+
+### Panel sign-in interception
+
+**Threat:** an attacker transfers their authorization callback to another browser, causing that user to pair a computer with the attacker's account.
+
+The panel binds each login to a signed, ten-minute browser cookie and uses PKCE S256 to bind the authorization code to that login. The callback rejects missing, mismatched, tampered, or expired transactions before exchanging the code and clears the login cookie when handling the callback. Production uses a host-only `Secure`, `HttpOnly`, `SameSite=Lax` cookie. Authorization-code reuse is rejected by the identity provider; the panel does not keep a server-side transaction ledger.
+
+### Pairing authorization interception
+
+**Threat:** an attacker tricks a user into redeeming a pairing code for an unintended computer or captures a pairing code before the legitimate user redeems it.
+
+**Controls:**
+
+- issue single-use pairing codes with a ten-minute TTL;
+- store only a SHA-256 hash of each code in the relay database;
+- rate-limit pairing-code creation and redemption;
+- require the human's authenticated control-panel session, validated for issuer, audience, provider allowlist, and the device-enrollment scope, to claim a code;
+- show the requesting device name and platform on the panel before the user confirms;
+- store only the issued revocable device credential on the paired computer.
+
+Before confirming, verify that the device name on the panel matches the computer being paired and that the panel is signed in to the intended account. Revoke an unfamiliar device immediately from the devices view of any paired computer (press `d`).
+
+### Stolen device token
+
+**Threat:** a device token is used to operate workers for the affected account, or to list and revoke that account's devices.
+
+**Controls:**
+
+- generate a 256-bit random secret;
+- transmit it only over HTTPS;
+- store only a salted scrypt hash in the relay database;
+- display or return the raw secret once;
+- store it locally in the operating-system credential store, with an explicit warning before a restricted file fallback;
+- support device-specific revocation, including self-revocation through `elix unpair`;
+- apply failed-authentication rate limiting and constant-time comparison;
+- never log Authorization headers.
+
+Device management authority is scoped to the token's own account, and enrolling a new device always requires a human to redeem its pairing code in an authenticated panel session: a device token cannot create another device. Revocation is visible in audit events and recoverable by re-pairing. A device token does not silently broaden a worker's selected access profile. The relay and worker still enforce that profile for every operation.
+
+### Stolen worker token
+
+**Threat:** an active worker credential is replayed against relay worker endpoints.
+
+**Controls:**
+
+- create an independent 256-bit random secret for each worker generation;
+- bind it to one account, device, worker ID, and generation;
+- store only its SHA-256 digest in relay process memory;
+- invalidate it on reconnect, unregister, device revocation, or liveness expiry;
+- reject mismatched worker IDs and generations;
+- transmit it only over HTTPS and never log Authorization headers;
+- keep the access profile in relay-side worker state and enforce it before queueing work.
+
+### Malicious or compromised MCP client
+
+**Threat:** an authenticated client requests destructive, overbroad, secret-seeking, or unrelated actions.
+
+**Controls:**
+
+- require explicit OAuth authorization and the `elix:access` scope;
+- publish accurate MCP tool schemas, output contracts, side-effect annotations, and use/disallow descriptions;
+- describe workspace capabilities and limits while leaving task routing to the client;
+- expose only one narrow root per worker and reject implicit home or filesystem-root exposure;
+- let the user select `read-only`, `workspace`, or explicit `system` authority at startup;
+- enforce the selected authority in both the relay and local worker;
+- treat startup as authorization only for operations inside the selected profile, without claiming per-command local confirmation;
+- show the selected profile and compact write or command activity in interactive sessions;
+- require explicit `--headless` startup for sessions without the local status and activity UI;
+- provide immediate disconnect, logout, and device revocation controls;
+- rely on the client to interpret file and command output as data, not authority;
+- reject recognizable authentication secrets in mutation and command inputs before relay dispatch, and suppress recognizable credential material before file or command results leave the worker.
+
+### Permission downgrade or metadata mismatch
+
+**Threat:** the relay, model, documentation, or local worker disagrees about the authority of an online workspace.
+
+**Controls:**
+
+- use one protocol enum and one permission-mapping function across the CLI and relay;
+- include the profile in current worker registration and echo it in the registration response;
+- expose the profile and derived booleans through `list_workspaces`;
+- reject writes and commands before relay dispatch when permission is absent;
+- reject the same operations again inside `LocalWorker`;
+- return stable `write_access_disabled` and `command_access_disabled` errors identifying the access requirement;
+- cover all profiles at the CLI, relay, MCP, and local-worker test layers.
+
+### Path escape
+
+**Threat:** absolute paths, parent traversal, symlinks, junctions, case aliases, or writable ancestors escape the structured file root.
+
+**Controls:**
+
+- enforce canonicalization, realpath, symlink, junction, and reparse-point checks for the host operating system;
+- validate existing paths and nearest writable ancestors locally;
+- reject absolute paths and lexical parent escapes;
+- revalidate root-relative paths for every structured file operation, including directory creation, deletion, and moves;
+- reject deleting or moving the exposed root, reject existing move destinations and self-nesting directory moves, and require an explicit recursive flag before deleting non-empty directories;
+- stream directory entries into bounded traversal state, skip links and unavailable files during listing and search, and cap entries, files, bytes, matches, lines, returned content, and elapsed local scan time;
+- preserve discovered native filenames; prefix POSIX names containing literal backslashes with `./` so they remain safely reusable, and normalize returned separators only on Windows;
+- preserve correct case-sensitive or case-insensitive comparison for the host;
+- verify Windows junction and reparse-point behavior and POSIX symlink behavior whenever path enforcement changes.
+
+### System-command authority
+
+**Threat:** a system-profile command reads secrets, modifies resources outside the root, reaches the network, or affects an external service.
+
+**Reality:** these are possible consequences of the explicitly selected `system` profile, not capabilities of structured file tools. Elix preserves arbitrary project command execution because using the existing local toolchain is a core function, but it does not describe that authority as sandboxed.
+
+**Controls and limits:**
+
+- make `workspace`, not `system`, the default;
+- require the user to start `elix --access system` explicitly;
+- describe local account authority in MCP context, with detailed disclosures in CLI help, HUD, quickstart, terms, security pages, and reviewer material;
+
+- reject recognizable authentication-secret inputs at the relay and worker;
+- scan textual file results, edit diffs, command-output chunks, and every retained output range locally; retain bounded overlap across chunks, clear captured and retained output, request bounded process-tree cleanup, and return `restricted_data_blocked` or `command_cleanup_failed` without matched data;
+- never enumerate, persist, or log environment variables automatically;
+- keep default command snapshots bounded; cap each retained range at 64 KiB, each retained stream at 1 MiB, terminal records at five minutes, and recent command records at eight; also bound command duration, concurrency, and status waits;
+- attempt bounded process-tree cleanup on cancellation, timeout, worker shutdown, disconnect, or secret detection;
+- make cancellation disclosure accurate: stopping a process does not undo prior local or external effects;
+- recommend a dedicated OS account, container, or VM for unattended or sensitive use.
+
+The authentication-secret detector is deliberately high-confidence. It does not recognize every custom, encoded, encrypted, compressed, fragmented, or transformed value, and it cannot prevent a command from sending data directly to the network. Detection can occur only after earlier command effects. The detector is defense in depth, not a sandbox, complete data-loss-prevention system, or substitute for a credential-free runtime. Public submission remains gated by the decision in [Restricted authentication data review](restricted-data.md).
+
+Command cleanup has a four-second response deadline, subject to event-loop scheduling. An existing tree-termination attempt still pending at that deadline may retain its bounded observers for eight additional seconds. POSIX cleanup signals the detached process group even after its leader exits and escalates from SIGTERM to SIGKILL after two seconds. Processes that leave that group are outside this mechanism. On Windows, Elix attempts `taskkill /T /F` with a ten-second deadline only while its owned root has no observed exit or terminating signal. That observation and taskkill's PID lookup are not atomic. Elix does not reconstruct ancestry from process-table snapshots or target an already-exited root PID: PID reuse and missing intermediate ancestors make those approaches unsafe. Windows descendants that retain output pipes after the root exits cannot be safely reclaimed by this implementation. A native ownership mechanism such as a Job Object would require a separate launch design.
+
+Failed, denied, or timed-out termination, or pipes that remain open after the cleanup deadline, returns `command_cleanup_failed`. Elix blocks new command starts and releases response waiters. Only a still-pending tree-termination attempt that subsequently succeeds, followed by pipe closure within the grace period, can remove its own blocker; it cannot clear another command's failure. Otherwise Elix closes its own streams and observers, releases timers, retains the failed record under the existing caps, and keeps starts disabled until restart. At most four admitted commands can retain cleanup observers, each for at most twelve seconds total. Other already-running commands keep their own lifecycles; shutdown still attempts cleanup of each active command and reports any failure. If stopping a timed-out taskkill helper is also denied, that helper may remain running. The user must inspect and stop remaining processes locally and confirm cleanup before restarting Elix. Secret-bearing output remains suppressed, including when cleanup fails. Neither a terminal command observation nor successful taskkill is proof that every operating-system process was killed.
+
+### Restricted Data in tool traffic
+
+**Threat:** a tool input, file result, edit diff, or command stream contains payment-card data subject to PCI DSS, protected health information, a government identifier, an API key, password, MFA or OTP code, access token, private key, or other authentication secret.
+
+**Architectural limit:** the implemented detector addresses recognizable authentication secrets only. It does not attempt to classify arbitrary text as PCI data, PHI, or a government identifier. A user-selected file may contain those categories before any general local-file bridge can know what it contains. The public submission gate in [Restricted Data review](restricted-data.md) therefore applies to all access profiles.
+
+**Controls:**
+
+- reject recognizable secret-bearing structured mutation paths plus `write_file`, `edit_file`, and `run_command` inputs in the relay before queueing a worker job;
+- repeat input checks locally so older or compromised relay behavior cannot bypass the worker boundary;
+- preflight an edited file before mutation and bind the edit to the scanned SHA-256 when the caller did not already provide one;
+- inspect textual content-bearing file results, command snapshots, and every retained command-output range before they leave the worker;
+- treat `view_image` as an explicit opaque-media exception: validate the root-confined regular-file path, a 4 MiB compressed-byte ceiling, and PNG/JPEG/WebP signatures locally, but do not claim to inspect pixels or embedded metadata for Restricted Data;
+- inspect command output incrementally with overlap across chunks so a token split across writes is still detected;
+- clear captured and retained output, request bounded command cleanup, and return a fixed safe error without the matched value;
+- redact restricted command inputs from local activity events;
+- permit explicit placeholders such as `<redacted>` and `replace-me` so documentation and fixtures remain usable;
+- test the detector against the repository corpus to prevent ordinary source code from becoming unreadable.
+
+**Limits:** the worker necessarily handles local bytes while deciding whether to block them, unknown formats can evade recognition, and a command can transmit data without printing it. Images returned by `view_image` are not OCR-scanned or metadata-scrubbed; visible text and embedded image metadata can therefore leave the worker without passing through the textual authentication-secret detector. The only dependable boundary against those cases is an isolated credential-free account or runtime with enforceable filesystem, agent, metadata-service, and network restrictions.
+
+### Logging leakage
+
+**Threat:** source code, command details, output, paths, tokens, or identities reach platform logs or durable audit storage.
+
+**Controls:**
+
+- record structured operational metadata only;
+- redact headers and bodies;
+- never attach request or response content to logs;
+- never add local absolute paths or path-derived repository names to relay metadata or logs;
+- retain an optional workspace label only when the user supplies it explicitly and only for the active worker lifetime;
+- omit file contents, command arguments, output, environment variables, and bearer tokens from durable audit events;
+- in production, emit OAuth authentication-failure security events containing only a fixed surface (`mcp_oauth` or `device_enrollment_oauth`) and fixed failure category; never include a token, subject, IP address, path, request body, or arbitrary error text;
+- configure the hosting/log-drain layer to alert when `relay_security_event` volume or repeated failure categories exceed the deployment's normal baseline, and verify that alert path before marketplace submission;
+- verify log scrubbing before deployment.
+
+### Relay compromise
+
+**Threat:** an attacker controls the routing service or its process memory.
+
+**Controls and limits:**
+
+- the relay does not possess local repository clones or durable developer credentials;
+- device or worker credentials can issue jobs while an authorized worker is exposed, so relay compromise remains serious;
+- relay-side profile enforcement reduces accidental overreach, while local enforcement remains authoritative against a forbidden operation;
+- minimize dependencies and privileges;
+- use managed platform patching, exact dependencies, secret scanning, short-lived worker credentials, and rapid device revocation;
+- keep production content out of logs and durable routing state.
+
+A fully malicious relay can still send any protocol job to a connected worker. The local profile boundary prevents a read-only or workspace worker from executing a command, but a `system` worker intentionally retains broad command authority. Stronger protection requires running that worker inside an isolated OS account, container, or VM.
+
+## Data retention
+
+Durably retain only what is needed for account, device, and security operation:
+
+- device ID, user-supplied name, platform, created, last-seen, and revoked timestamps;
+- OAuth subject identifier;
+- metadata-only audit event type, status, and timestamp;
+- optional request timing events limited to a bounded operation label, HTTP status, and duration, with no identifiers, paths, arguments, output, tokens, or request bodies;
+- production OAuth failure events limited to the fixed `relay_security_event` name, a bounded authentication surface, and a bounded failure category, with platform timestamps supplied by the hosting/logging layer;
+- request error events limited to the HTTP method, matched route pattern, status, error class name, a bounded error code, and stack frames, never the error message, raw URL, or request body, because messages can quote request content;
+- aggregate daily usage counts keyed only by UTC day and a fixed metric name, plus a five-minute `relay_usage` log line with online worker and account totals.
+
+Do not durably retain:
+
+- file content;
+- command input or output;
+- environment variables;
+- full local paths;
+- repository names unless explicitly supplied as an ephemeral label;
+- OAuth, device, or worker bearer secrets;
+- reviewer passwords or other portal credentials.
+
+Additional defenses must extend these controls rather than replace them.

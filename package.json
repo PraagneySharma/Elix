@@ -1,0 +1,46 @@
+{
+  "name": "elix",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "npm@11.12.1",
+  "description": "Managed MCP relay for explicitly exposed local coding workspaces.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run clean && npm run build --workspace @elix/protocol && npm run build --workspace @praagney/elix && npm run build --workspace @elix/relay",
+    "check": "npm run docs:build && npm run site:check && npm run review:check && npm run build && npm run cli:smoke && npm test && npm run cli:smoke:update",
+    "clean": "node scripts/clean.mjs",
+    "dev": "npm run build --workspace @elix/protocol && npm run dev --workspace @elix/relay",
+    "dev:auth": "node --import tsx scripts/dev-auth.ts",
+    "dev:setup": "node scripts/dev-setup.mjs",
+    "dev:down": "docker compose down",
+    "docs:build": "node scripts/build-docs.mjs",
+    "site:check": "node scripts/check-site-chrome.mjs",
+    "cli:hud-preview": "npm run build --workspace @elix/protocol && npm run hud:preview --workspace @praagney/elix --",
+    "cli:prepare": "node scripts/prepare-cli-release.mjs",
+    "cli:smoke:update": "node packages/cli/scripts/smoke-update.mjs",
+    "integration:smoke": "node --import tsx scripts/integration-smoke.ts",
+    "integration:local": "node scripts/integration-local.mjs",
+    "test:soak": "node --expose-gc --max-old-space-size=96 --import tsx scripts/resource-soak.ts",
+    "test": "npm run test --workspace @elix/relay && npm run test --workspace @praagney/elix",
+    "review:metadata:check": "node scripts/check-metadata-golden.mjs",
+    "review:check": "npm run review:metadata:check && node scripts/check-review-readiness.mjs && node --import tsx scripts/check-restricted-data-corpus.ts && node scripts/check-plugin-package.mjs plugin/elix",
+    "review:check:production": "node scripts/check-production-review-surface.mjs",
+    "review:check:plugin": "node scripts/build-plugin-package.mjs && node scripts/check-plugin-package.mjs",
+    "review:check:submission": "npm run check && npm run review:check:production && npm audit --audit-level=high && npm run review:check:plugin && npm pack --workspace @praagney/elix --dry-run && git diff --check",
+    "review:fixture:prepare": "node scripts/prepare-app-review-workspace.mjs --reset",
+    "cli:smoke": "node packages/cli/scripts/smoke-standalone.mjs node packages/cli/dist/main.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "jose": "6.2.3",
+    "marked": "18.0.6"
+  }
+}

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/PraagneySharma/Elix/security/advisories/new
+    about: Do not disclose credentials, private source code, personal data, or vulnerability details in a public issue.
+  - name: Read the Elix support guide
+    url: https://elix-eight.vercel.app/support
+    about: Review setup checks, account controls, and safe diagnostic guidance before opening an issue.

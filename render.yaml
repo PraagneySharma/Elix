@@ -1,0 +1,53 @@
+# Elix hobby deployment using Render's FREE web plan.
+# No paid Render service or database is provisioned by this Blueprint.
+# Create a separate free PostgreSQL database (such as Neon Free) first.
+# Free services can sleep, have usage limits, and are not reliable production hosting.
+# Review Render's billing and bandwidth limits before applying.
+services:
+  - type: web
+    name: elix-relay
+    runtime: node
+    plan: free
+    region: ohio
+    branch: main
+    autoDeployTrigger: "off"
+    domains:
+      - mcp.praagney.com
+    healthCheckPath: /healthz
+    buildCommand: npm ci --include=dev && npm run build --workspace @elix/protocol && npm run build --workspace @elix/relay
+    # The Free plan does not support pre-deploy commands, so run idempotent migrations on startup.
+    startCommand: npm run migrate --workspace @elix/relay && npm run start --workspace @elix/relay
+    envVars:
+      - key: NODE_VERSION
+        value: 24.18.0
+      - key: NODE_ENV
+        value: production
+      - key: ELIX_BIND_HOST
+        value: 0.0.0.0
+      - key: ELIX_PUBLIC_ORIGIN
+        value: https://mcp.praagney.com
+      - key: ELIX_AUTH0_AUDIENCE
+        value: https://mcp.praagney.com/
+      - key: ELIX_AUTH0_ISSUER
+        sync: false
+      - key: ELIX_AUTH0_ALLOWED_SUBJECT_PREFIXES
+        value: never-admit|
+      - key: ELIX_AUTH0_ALLOWED_SUBJECTS
+        sync: false
+      - key: ELIX_MCP_REQUIRED_SCOPE
+        value: veronica:access
+      - key: ELIX_DEVICE_ENROLL_SCOPE
+        value: veronica:device
+      - key: ELIX_PANEL_CLIENT_ID
+        sync: false
+      - key: ELIX_PANEL_CLIENT_SECRET
+        sync: false
+      - key: ELIX_PANEL_SESSION_SECRET
+        generateValue: true
+      - key: ELIX_DATABASE_SSL_MODE
+        value: verify-full
+      # Paste a free Neon PostgreSQL connection string in Render's protected settings.
+      # Do not include ?sslmode=require or any other SSL URL query parameters;
+      # the relay independently verifies TLS certificates.
+      - key: DATABASE_URL
+        sync: false

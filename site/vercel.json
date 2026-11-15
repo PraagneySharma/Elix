@@ -1,0 +1,75 @@
+{
+  "ignoreCommand": "git diff HEAD^ HEAD --quiet -- ':(top)site' ':(top)docs' ':(top)scripts' ':(top)package.json' ':(top)package-lock.json'",
+  "installCommand": "npm ci --ignore-scripts --no-audit --no-fund",
+  "buildCommand": "npm run docs:build && npm run site:check",
+  "outputDirectory": ".",
+  "cleanUrls": true,
+  "redirects": [
+    {
+      "source": "/panel",
+      "destination": "https://mcp.praagney.com/panel",
+      "permanent": false
+    },
+    {
+      "source": "/panel/:path*",
+      "destination": "https://mcp.praagney.com/panel/:path*",
+      "permanent": false
+    },
+    {
+      "source": "/get-started",
+      "destination": "/docs/quickstart",
+      "permanent": true
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/install",
+      "destination": "/install.ps1"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/install",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300"
+        }
+      ]
+    },
+    {
+      "source": "/install.sh",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300"
+        }
+      ]
+    },
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=()"
+        }
+      ]
+    }
+  ]
+}

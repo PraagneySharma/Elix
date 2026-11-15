@@ -1,0 +1,209 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import test from "node:test";
+import {
+  configureUpdates,
+  isUpdateCheckDue,
+  loadUpdateState,
+  observeMcpContractVersion,
+  recordUpdateCheck,
+  UPDATE_CHECK_INTERVAL_MS,
+  withUpdateStateLease,
+} from "./update-state.js";
+
+test("uses version-aware defaults and persists update settings", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "elix-update-state-"));
+  const file = path.join(directory, "updates.json");
+  try {
+    assert.deepEqual(await loadUpdateState("0.1.0-beta.13", file), {
+      policy: "notify",
+      channel: "beta",
+    });
+    assert.deepEqual(await loadUpdateState("0.1.0", file), {
+      policy: "notify",
+      channel: "stable",
+    });
+
+    const configured = await configureUpdates(
+      "0.1.0-beta.13",
+      { policy: "auto", channel: "stable" },
+      file,
+    );
+    assert.equal(configured.policy, "auto");
+    assert.equal(configured.channel, "stable");
+
+    const checkedAt = new Date("2026-07-31T12:00:00.000Z");
+    const recorded = await recordUpdateCheck(
+      { currentVersion: "0.1.0-beta.13", availableVersion: "0.1.0-beta.13", channel: "stable", updateAvailable: false },
+      checkedAt,
+      file,
+    );
+    assert.equal(recorded.lastCheckedAt, checkedAt.toISOString());
+    assert.equal(
+      await observeMcpContractVersion("0.1.0-beta.13", "3.1.0", file),
+      false,
+    );
+    assert.equal(
+      await observeMcpContractVersion("0.1.0-beta.13", "3.1.0", file),
+      false,
+    );
+    assert.equal(
+      await observeMcpContractVersion("0.1.0-beta.13", "3.2.0", file),
+      true,
+    );
+    assert.match(await readFile(file, "utf8"), /"policy": "auto"/);
+    const reset = await configureUpdates(
+      "0.1.0-beta.13",
+      { policy: "off" },
+      file,
+    );
+    assert.deepEqual(reset, {
+      policy: "off",
+      channel: "stable",
+      mcpContractVersion: "3.2.0",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("serializes update state read-modify-writes", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "elix-update-state-lock-"));
+  const file = path.join(directory, "updates.json");
+  try {
+    await configureUpdates("0.1.0", { policy: "auto" }, file);
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let holding = false;
+    const holder = withUpdateStateLease(async () => {
+      holding = true;
+      await gate;
+    }, file);
+    while (!holding) await delay(1);
+
+    const checkedAt = new Date("2026-08-21T12:00:00.000Z");
+    let checkFinished = false;
+    let contractFinished = false;
+    const check = recordUpdateCheck({
+      currentVersion: "0.1.0", availableVersion: "0.1.0", channel: "stable", updateAvailable: false,
+    }, checkedAt, file).then((state) => {
+      checkFinished = true;
+      return state;
+    });
+    const contract = observeMcpContractVersion("0.1.0", "3.1.0", file).then((changed) => {
+      contractFinished = true;
+      return changed;
+    });
+
+    await delay(50);
+    assert.equal(checkFinished, false);
+    assert.equal(contractFinished, false);
+    release();
+    await holder;
+    await Promise.all([check, contract]);
+
+    assert.deepEqual(await loadUpdateState("0.1.0", file), {
+      policy: "auto",
+      channel: "stable",
+      lastCheckedAt: checkedAt.toISOString(),
+      mcpContractVersion: "3.1.0",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ignores malformed update state and calculates the daily interval", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "elix-update-state-"));
+  const file = path.join(directory, "updates.json");
+  try {
+    await writeFile(file, "not-json", "utf8");
+    assert.deepEqual(await loadUpdateState("0.1.0-beta.13", file), {
+      policy: "notify",
+      channel: "beta",
+    });
+    for (const value of [null, [], 42, "state"]) {
+      await writeFile(file, JSON.stringify(value), "utf8");
+      assert.deepEqual(await loadUpdateState("0.1.0", file), { policy: "notify", channel: "stable" });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+
+  const checkedAt = Date.parse("2026-07-31T12:00:00.000Z");
+  assert.equal(isUpdateCheckDue(undefined, checkedAt), true);
+  assert.equal(isUpdateCheckDue(new Date(checkedAt).toISOString(), checkedAt), false);
+  assert.equal(
+    isUpdateCheckDue(
+      new Date(checkedAt).toISOString(),
+      checkedAt + UPDATE_CHECK_INTERVAL_MS,
+    ),
+    true,
+  );
+  assert.equal(isUpdateCheckDue("invalid", checkedAt), true);
+  assert.equal(isUpdateCheckDue(new Date(checkedAt + UPDATE_CHECK_INTERVAL_MS).toISOString(), checkedAt), true);
+});
+
+test("retains an available release between checks and invalidates obsolete notices", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "elix-update-notice-"));
+  const file = path.join(directory, "updates.json");
+  const info = { currentVersion: "0.2.4", availableVersion: "0.2.5", channel: "stable" as const, updateAvailable: true };
+  const checkedAt = new Date();
+  try {
+    await recordUpdateCheck(info, checkedAt, file);
+    const saved = await loadUpdateState(info.currentVersion, file);
+    assert.deepEqual(saved.availableUpdate, {
+      currentVersion: "0.2.4", availableVersion: "0.2.5", channel: "stable",
+    });
+    assert.equal(isUpdateCheckDue(saved.lastCheckedAt, checkedAt.getTime()), false);
+    await observeMcpContractVersion(info.currentVersion, "3.2.0", file);
+    assert.deepEqual((await loadUpdateState(info.currentVersion, file)).availableUpdate, saved.availableUpdate);
+    for (const version of ["0.2.5", "0.2.6", "0.2.3", "0.2.4-beta.1"]) {
+      assert.equal((await loadUpdateState(version, file)).availableUpdate, undefined, version);
+    }
+    await recordUpdateCheck({ ...info, availableVersion: "0.2.3", updateAvailable: false }, checkedAt, file);
+    assert.equal((await loadUpdateState(info.currentVersion, file)).availableUpdate, undefined);
+    await recordUpdateCheck(info, checkedAt, file);
+    await configureUpdates(info.currentVersion, { channel: "beta" }, file);
+    await recordUpdateCheck(info, checkedAt, file);
+    const switched = await loadUpdateState(info.currentVersion, file);
+    assert.equal(switched.availableUpdate, undefined);
+    assert.equal(switched.lastCheckedAt, undefined, "a response from the old channel must not delay its new check");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("only loads a bounded newer release for the checked version and channel", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "elix-update-notice-invalid-"));
+  const file = path.join(directory, "updates.json");
+  const availableUpdate = { currentVersion: "0.2.4", availableVersion: "0.2.5", channel: "stable" };
+  try {
+    for (const candidate of [
+      null, [], "0.2.5",
+      { ...availableUpdate, availableVersion: "0.2.4" },
+      { ...availableUpdate, availableVersion: "0.2.3" },
+      { ...availableUpdate, availableVersion: "0.2.5-beta.1" },
+      { ...availableUpdate, availableVersion: "0.2.5\u001b[31m" },
+      { ...availableUpdate, availableVersion: `0.2.5+${"a".repeat(256)}` },
+      { ...availableUpdate, availableVersion: 5 },
+      { ...availableUpdate, currentVersion: "0.2.3" },
+      { ...availableUpdate, channel: "beta" },
+    ]) {
+      await writeFile(file, JSON.stringify({ policy: "notify", channel: "stable", availableUpdate: candidate }), "utf8");
+      assert.equal((await loadUpdateState("0.2.4", file)).availableUpdate, undefined);
+    }
+    await writeFile(file, JSON.stringify({ policy: "notify", channel: "beta", availableUpdate: {
+      ...availableUpdate, availableVersion: "0.3.0-beta.1", channel: "beta",
+    } }), "utf8");
+    assert.equal((await loadUpdateState("0.2.4", file)).availableUpdate?.availableVersion, "0.3.0-beta.1");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

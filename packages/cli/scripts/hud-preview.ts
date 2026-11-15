@@ -1,0 +1,519 @@
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { Resvg } from "@resvg/resvg-js";
+import xtermHeadless from "@xterm/headless";
+import type { WorkerJob } from "@elix/protocol";
+import {
+  activityCallByteLength,
+  activityCallFromJob,
+  formatActivityCall,
+} from "../src/ui-hud-activity.js";
+import type { HudActivity, HudState } from "../src/ui-hud-model.js";
+
+const { Terminal } = xtermHeadless;
+
+const SCREENS = [
+  "activity",
+  "activity-detailed",
+  "activity-selected",
+  "activity-detail",
+  "activity-detail-read",
+  "activity-detail-working",
+  "activity-empty",
+  "workspace",
+  "workspace-switching",
+  "access-confirm",
+  "devices",
+  "devices-loading",
+  "devices-empty",
+  "device-revoke",
+  "device-busy",
+] as const;
+type PreviewScreen = typeof SCREENS[number];
+
+const PREVIEW_NOW = Date.UTC(2026, 7, 20, 14, 0, 0);
+const DEFAULT_COLUMNS = 90;
+const DEFAULT_ROWS = 24;
+const MIN_COLUMNS = 24;
+const MAX_COLUMNS = 200;
+const MIN_ROWS = 8;
+const MAX_ROWS = 80;
+const CELL_WIDTH = 10;
+const CELL_HEIGHT = 22;
+const FONT_SIZE = 16;
+const PADDING = 20;
+const FOREGROUND = "#f4f1fb";
+const BACKGROUND = "#100e16";
+const ANSI_16 = [
+  "#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+  "#7f7f7f", "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
+] as const;
+
+interface PreviewOptions {
+  screen: PreviewScreen;
+  columns: number;
+  rows: number;
+  clean: boolean;
+}
+
+class UsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UsageError";
+  }
+}
+
+const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const previewDirectory = path.join(repositoryRoot, ".hud-preview");
+const previewImage = path.join(previewDirectory, "current.png");
+const require = createRequire(import.meta.url);
+const fontRoot = path.dirname(require.resolve("dejavu-fonts-ttf/package.json"));
+const fontFiles = [
+  "DejaVuSansMono.ttf",
+  "DejaVuSansMono-Bold.ttf",
+  "DejaVuSansMono-Oblique.ttf",
+  "DejaVuSansMono-BoldOblique.ttf",
+].map((file) => path.join(fontRoot, "ttf", file));
+
+function usage(): string {
+  return [
+    "Usage: npm run cli:hud-preview -- [options]",
+    "",
+    `  --screen <${SCREENS.join("|")}>`,
+    `  --width <${MIN_COLUMNS}-${MAX_COLUMNS}>`,
+    `  --height <${MIN_ROWS}-${MAX_ROWS}>`,
+    "  --clean",
+    "  --help",
+  ].join("\n");
+}
+
+function boundedInteger(value: string | undefined, label: string, min: number, max: number): number {
+  if (!value || !/^\d+$/.test(value)) throw new UsageError(`${label} must be an integer from ${min} through ${max}.`);
+  const parsed = Number(value);
+  if (parsed < min || parsed > max) throw new UsageError(`${label} must be from ${min} through ${max}.`);
+  return parsed;
+}
+
+function parseArgs(args: string[]): PreviewOptions | "help" {
+  const options: PreviewOptions = {
+    screen: "activity",
+    columns: DEFAULT_COLUMNS,
+    rows: DEFAULT_ROWS,
+    clean: false,
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--help" || argument === "-h") return "help";
+    if (argument === "--clean") {
+      options.clean = true;
+    } else if (argument === "--screen") {
+      const value = args[++index];
+      if (!value || !SCREENS.includes(value as PreviewScreen)) {
+        throw new UsageError(`--screen must be one of: ${SCREENS.join(", ")}.`);
+      }
+      options.screen = value as PreviewScreen;
+    } else if (argument === "--width") {
+      options.columns = boundedInteger(args[++index], "--width", MIN_COLUMNS, MAX_COLUMNS);
+    } else if (argument === "--height") {
+      options.rows = boundedInteger(args[++index], "--height", MIN_ROWS, MAX_ROWS);
+    } else {
+      throw new UsageError(`Unknown option: ${argument}`);
+    }
+  }
+  return options;
+}
+
+function previewActivity(
+  job: WorkerJob,
+  state: HudActivity["state"],
+  startedAt: number,
+  updatedAt: number,
+): HudActivity {
+  const call = activityCallFromJob(job);
+  const output: HudActivity["output"] = state === "working"
+    ? undefined
+    : state === "failed"
+      ? {
+          kind: "error",
+          preview: job.type === "run_command"
+            ? "src/ui-hud.test.ts: activity footer mismatch\n… output truncated …\n1 test failed"
+            : "The operation failed.",
+          truncated: job.type === "run_command",
+        }
+      : job.type === "read_file"
+        ? {
+            kind: "success",
+            preview: "import React from \"react\";\nimport { Box, Text } from \"ink\";\n… output truncated …\nexport function HudScreen(...) { ... }",
+            truncated: true,
+          }
+        : { kind: "success", preview: "Completed successfully." };
+  return {
+    tool: job.type,
+    summary: {
+      target: formatActivityCall(call, "detailed", 512),
+      details: [],
+      truncation: "middle",
+    },
+    compactSummary: formatActivityCall(call, "compact", 512),
+    call,
+    callBytes: activityCallByteLength(call),
+    ...(output ? { output } : {}),
+    requestId: job.requestId,
+    state,
+    startedAt,
+    updatedAt,
+  };
+}
+
+function previewActivities(now: number): HudActivity[] {
+  const jobs: Array<{
+    job: WorkerJob;
+    state: HudActivity["state"];
+    startedAt: number;
+    updatedAt: number;
+  }> = [
+    {
+      job: {
+        type: "list_files",
+        requestId: "00000000-0000-4000-8000-000000000001",
+        path: "packages/cli/src",
+        recursive: true,
+        limit: 100,
+        timeoutMs: 8_000,
+      },
+      state: "returned",
+      startedAt: now - 243_000,
+      updatedAt: now - 240_000,
+    },
+    {
+      job: {
+        type: "read_file",
+        requestId: "00000000-0000-4000-8000-000000000002",
+        path: "packages/cli/src/ui-hud.tsx",
+      },
+      state: "returned",
+      startedAt: now - 56_000,
+      updatedAt: now - 55_000,
+    },
+    {
+      job: {
+        type: "search_text",
+        requestId: "00000000-0000-4000-8000-000000000003",
+        query: "activityPageCapacity",
+        path: "packages/cli/src",
+        extensions: [".ts", ".tsx"],
+        timeoutMs: 8_000,
+      },
+      state: "returned",
+      startedAt: now - 33_000,
+      updatedAt: now - 31_000,
+    },
+    {
+      job: {
+        type: "read_file_range",
+        requestId: "00000000-0000-4000-8000-000000000004",
+        path: "packages/cli/src/ui-hud-model.test.ts",
+        startLine: 700,
+        lineCount: 121,
+        timeoutMs: 8_000,
+      },
+      state: "returned",
+      startedAt: now - 24_000,
+      updatedAt: now - 22_000,
+    },
+    {
+      job: {
+        type: "edit_file",
+        requestId: "00000000-0000-4000-8000-000000000005",
+        path: "packages/cli/src/ui-hud.tsx",
+        edits: [
+          { oldText: "old one", newText: "new one" },
+          { oldText: "old two", newText: "new two" },
+        ],
+        expectedSha256: "b".repeat(64),
+      },
+      state: "returned",
+      startedAt: now - 14_000,
+      updatedAt: now - 12_000,
+    },
+    {
+      job: {
+        type: "run_command",
+        requestId: "00000000-0000-4000-8000-000000000006",
+        argv: [
+          "npm",
+          "run",
+          "check",
+          "--workspace",
+          "@praagney/elix",
+          "--",
+          "--reporter",
+          "spec",
+        ],
+        timeoutMs: 120_000,
+      },
+      state: "failed",
+      startedAt: now - 14_000,
+      updatedAt: now - 9_000,
+    },
+    {
+      job: {
+        type: "view_image",
+        requestId: "00000000-0000-4000-8000-000000000007",
+        path: ".hud-preview/current.png",
+      },
+      state: "returned",
+      startedAt: now - 6_000,
+      updatedAt: now - 5_000,
+    },
+    {
+      job: {
+        type: "run_command",
+        requestId: "00000000-0000-4000-8000-000000000008",
+        argv: ["npm", "run", "cli:hud-preview", "--", "--screen", "activity"],
+        timeoutMs: 900_000,
+        waitMs: 0,
+      },
+      state: "working",
+      startedAt: now - 18_000,
+      updatedAt: now - 18_000,
+    },
+  ];
+  return jobs.map(({ job, state, startedAt, updatedAt }) =>
+    previewActivity(job, state, startedAt, updatedAt)
+  );
+}
+
+async function previewState(screen: PreviewScreen): Promise<HudState> {
+  const { initialHudState } = await import("../src/ui-hud-model.js");
+  const activities = previewActivities(PREVIEW_NOW);
+  const failed = activities.find((activity) => activity.state === "failed")?.requestId;
+  const read = activities.find((activity) => activity.tool === "read_file")?.requestId;
+  const working = activities.find((activity) => activity.state === "working")?.requestId;
+  const center = activities[Math.floor(activities.length / 2)]?.requestId;
+  const state: HudState = {
+    ...initialHudState("/workspace/elix-preview"),
+    accessProfile: "system",
+    deviceName: "Preview workstation",
+    connection: "connected",
+    connectedBefore: true,
+    activities,
+    status: {
+      relay: "Local preview relay",
+      activeWorkers: 2,
+      devices: [
+        { id: "preview-device-1", name: "Preview workstation", platform: "darwin-arm64", lastSeen: "just now", status: "1 active workspace", current: true },
+        { id: "preview-device-2", name: "Build machine", platform: "linux-x64", lastSeen: "3m ago", status: "offline" },
+      ],
+    },
+  };
+  if (screen === "activity-empty") {
+    return {
+      ...state,
+      view: "activity",
+      activities: [],
+      activitySelection: undefined,
+    };
+  }
+  if (screen === "activity-detailed") {
+    return {
+      ...state,
+      view: "activity",
+      activityMode: "detailed",
+    };
+  }
+  if (screen === "activity-selected") {
+    return {
+      ...state,
+      view: "activity",
+      activitySelection: center,
+    };
+  }
+  if (screen === "activity-detail") {
+    return {
+      ...state,
+      view: "activity-detail",
+      activitySelection: failed,
+    };
+  }
+  if (screen === "activity-detail-read") {
+    return {
+      ...state,
+      view: "activity-detail",
+      activitySelection: read,
+    };
+  }
+  if (screen === "activity-detail-working") {
+    return {
+      ...state,
+      view: "activity-detail",
+      activitySelection: working,
+    };
+  }
+  if (screen === "workspace-switching") {
+    return {
+      ...state,
+      view: "workspace",
+      connection: "connecting",
+      accessProfile: "workspace",
+      pendingAccessProfile: "system",
+    };
+  }
+  if (screen === "access-confirm") {
+    return {
+      ...state,
+      view: "workspace",
+      accessProfile: "workspace",
+      prompt: { type: "access-confirm", accessProfile: "system" },
+    };
+  }
+  if (screen === "devices-loading") {
+    return {
+      ...state,
+      view: "devices",
+      status: undefined,
+      statusLoading: true,
+    };
+  }
+  if (screen === "devices-empty") {
+    return {
+      ...state,
+      view: "devices",
+      status: { relay: "Local preview relay", activeWorkers: 0, devices: [] },
+    };
+  }
+  if (screen === "device-revoke") {
+    return {
+      ...state,
+      view: "devices",
+      deviceSelection: 1,
+      prompt: { type: "revoke-confirm", deviceIndex: 1 },
+    };
+  }
+  if (screen === "device-busy") {
+    return {
+      ...state,
+      view: "devices",
+      deviceSelection: 1,
+      busy: true,
+      busyMessage: "Revoking Build machine…",
+    };
+  }
+  return { ...state, view: screen };
+}
+
+function paletteColor(index: number): string {
+  if (index < 16) return ANSI_16[index] ?? FOREGROUND;
+  if (index < 232) {
+    const value = index - 16;
+    const levels = [0, 95, 135, 175, 215, 255];
+    const red = levels[Math.floor(value / 36)]!;
+    const green = levels[Math.floor((value % 36) / 6)]!;
+    const blue = levels[value % 6]!;
+    return `rgb(${red},${green},${blue})`;
+  }
+  const gray = 8 + (index - 232) * 10;
+  return `rgb(${gray},${gray},${gray})`;
+}
+
+function rgbColor(value: number): string {
+  return `#${value.toString(16).padStart(6, "0")}`;
+}
+
+function xml(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+}
+
+async function terminalSvg(ansi: string, columns: number, rows: number): Promise<string> {
+  const terminal = new Terminal({ cols: columns, rows, convertEol: true, allowProposedApi: true, scrollback: 0 });
+  await new Promise<void>((resolve) => terminal.write(ansi, resolve));
+
+  const width = PADDING * 2 + columns * CELL_WIDTH;
+  const height = PADDING * 2 + rows * CELL_HEIGHT;
+  const elements = [`<rect width="${width}" height="${height}" fill="${BACKGROUND}"/>`];
+  const buffer = terminal.buffer.active;
+
+  for (let row = 0; row < rows; row += 1) {
+    const line = buffer.getLine(buffer.viewportY + row);
+    if (!line) continue;
+    for (let column = 0; column < columns; column += 1) {
+      const cell = line.getCell(column);
+      if (!cell || cell.getWidth() === 0) continue;
+
+      let foreground = cell.isFgRGB() ? rgbColor(cell.getFgColor()) : cell.isFgPalette() ? paletteColor(cell.getFgColor()) : FOREGROUND;
+      let background = cell.isBgRGB() ? rgbColor(cell.getBgColor()) : cell.isBgPalette() ? paletteColor(cell.getBgColor()) : BACKGROUND;
+      if (cell.isInverse()) [foreground, background] = [background, foreground];
+
+      const x = PADDING + column * CELL_WIDTH;
+      const y = PADDING + row * CELL_HEIGHT;
+      if (background !== BACKGROUND) {
+        elements.push(`<rect x="${x}" y="${y}" width="${CELL_WIDTH * cell.getWidth()}" height="${CELL_HEIGHT}" fill="${background}"/>`);
+      }
+
+      const chars = cell.getChars();
+      if (!chars || cell.isInvisible()) continue;
+      const weight = cell.isBold() ? "700" : "400";
+      const style = cell.isItalic() ? ' font-style="italic"' : "";
+      const decorations = [cell.isUnderline() ? "underline" : "", cell.isStrikethrough() ? "line-through" : ""].filter(Boolean).join(" ");
+      const decoration = decorations ? ` text-decoration="${decorations}"` : "";
+      const opacity = cell.isDim() ? ' opacity="0.65"' : "";
+      elements.push(`<text x="${x}" y="${y + FONT_SIZE + 1}" fill="${foreground}" font-weight="${weight}"${style}${decoration}${opacity}>${xml(chars)}</text>`);
+    }
+  }
+  terminal.dispose();
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><g font-family="DejaVu Sans Mono" font-size="${FONT_SIZE}" xml:space="preserve">${elements.join("")}</g></svg>`;
+}
+
+async function renderPng(ansi: string, columns: number, rows: number): Promise<Buffer> {
+  const svg = await terminalSvg(ansi, columns, rows);
+  return Buffer.from(new Resvg(svg, {
+    font: {
+      defaultFontFamily: "DejaVu Sans Mono",
+      fontFiles,
+      loadSystemFonts: false,
+    },
+  }).render().asPng());
+}
+
+async function main(): Promise<void> {
+  const options = parseArgs(process.argv.slice(2));
+  if (options === "help") {
+    console.log(usage());
+    return;
+  }
+  if (options.clean) {
+    await rm(previewDirectory, { recursive: true, force: true });
+    console.log("Removed .hud-preview/.");
+    return;
+  }
+
+  process.env.FORCE_COLOR = "3";
+  const [{ renderHud }, state] = await Promise.all([import("../src/ui-hud.js"), previewState(options.screen)]);
+  const plain = renderHud(state, options.columns, false, options.rows, PREVIEW_NOW);
+  const ansi = renderHud(state, options.columns, true, options.rows, PREVIEW_NOW);
+  const png = await renderPng(ansi, options.columns, options.rows);
+
+  await rm(previewDirectory, { recursive: true, force: true });
+  await mkdir(previewDirectory, { recursive: true });
+  await writeFile(previewImage, png);
+
+  console.log(plain);
+  console.log("");
+  console.log(`Preview: .hud-preview/current.png (${options.screen}, ${options.columns}x${options.rows})`);
+  console.log("Each run replaces the preview directory. Use --clean to remove it.");
+}
+
+await main().catch((error: unknown) => {
+  if (error instanceof UsageError) {
+    console.error(error.message);
+    console.error("");
+    console.error(usage());
+  } else {
+    console.error(error);
+  }
+  process.exitCode = 1;
+});

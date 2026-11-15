@@ -1,0 +1,322 @@
+#!/usr/bin/env node
+import {
+  parseInvocation,
+  UsageError,
+  type CliInvocation,
+} from "./cli-options.js";
+import { deviceStatus, formatRelativeTime } from "./device-format.js";
+import {
+  listDevices,
+  loadRelayEndpoints,
+  revokeDevice,
+} from "./relay-client.js";
+import {
+  checkForUpdate,
+  cleanupUpdateBackups,
+  installUpdate,
+  type ElixDistribution,
+  type UpdateInfo,
+} from "./update-service.js";
+import {
+  configureUpdates,
+  isUpdateCheckDue,
+  loadUpdateState,
+  recordUpdateCheck,
+} from "./update-state.js";
+import { withUpdateLease, withWorkspaceLease } from "./update-lock.js";
+import { unpairComputer } from "./unpair.js";
+import {
+  deviceForSession,
+  headlessReporter,
+  INTERACTIVE_TERMINAL_REQUIRED,
+  runManagedSession,
+} from "./worker/managed-session.js";
+import { selectExposureRoot } from "./worker/root-selection.js";
+import { acquireWorkspaceLease } from "./worker/workspace-lease.js";
+
+declare const __ELIX_VERSION__: string;
+declare const __ELIX_DISTRIBUTION__: ElixDistribution;
+
+const VERSION = __ELIX_VERSION__;
+const DISTRIBUTION = __ELIX_DISTRIBUTION__;
+
+const HELP = `Elix ${VERSION}
+
+Usage:
+  elix [--headless] [--access <read-only|workspace|system>] [--label <name>] [--keep-awake] [directory]
+  elix unpair
+  elix update [--check]
+  elix update --policy <notify|auto|off>
+  elix update --channel <beta|stable>
+  elix --help
+  elix --version
+
+Running elix opens one workspace in an interactive terminal.
+Use --headless to run without the terminal HUD or local activity history.
+Access defaults to workspace: guarded file reads and writes, with commands disabled.
+Use read-only to prevent file changes. Use system only when ChatGPT must run commands;
+those commands inherit this account's permissions, environment, credentials, and network.
+Update checks run at most once per day before a workspace connects.
+On Windows, --keep-awake prevents idle sleep during the workspace session.
+The display can turn off. Lid closure still follows Windows settings; select
+"Do nothing" for lid closure while plugged in. Use AC power for long sessions.
+
+Keys:
+  a  activity
+  w  workspace
+  d  devices
+  ↑↓ browse or select the current list
+  ←→ change workspace access
+  Enter  select, inspect, or revoke
+  Esc  back to the previous view or workspace
+  q  disconnect and quit`;
+
+async function runWorkspaceSession(
+  { path, label, accessProfile, headless, keepAwake }: Extract<CliInvocation, { command: "workspace" }>,
+  initialNotice?: string,
+): Promise<void> {
+  const root = await selectExposureRoot(path);
+  const lease = await acquireWorkspaceLease(root);
+  try {
+    const endpoints = loadRelayEndpoints();
+    const device = await deviceForSession(endpoints);
+    if (headless) {
+      if (initialNotice) console.error(initialNotice);
+      await runManagedSession(root, endpoints, {
+        device,
+        workerVersion: VERSION,
+        accessProfile,
+        ...(keepAwake ? { keepAwake: true } : {}),
+        ...(label ? { workspaceLabel: label } : {}),
+        onEvent: headlessReporter(),
+        quiet: true,
+      });
+      return;
+    }
+
+    const [{ runSessionHud }, { retainPostExitNotice }] = await Promise.all([
+      import("./ui-hud.js"),
+      import("./ui-hud-model.js"),
+    ]);
+    let postExitNotice: string | undefined;
+    let requestedAccessProfile = accessProfile;
+    let activeSessionController: AbortController | undefined;
+    await runSessionHud({
+      workspace: root,
+      ...(label ? { workspaceLabel: label } : {}),
+      ...(initialNotice ? { initialNotice } : {}),
+      run: async (signal, onEvent) => {
+        while (!signal.aborted) {
+          const sessionAccessProfile = requestedAccessProfile;
+          const sessionController = new AbortController();
+          activeSessionController = sessionController;
+          const stopSession = (): void => sessionController.abort(signal.reason);
+          if (signal.aborted) sessionController.abort(signal.reason);
+          else signal.addEventListener("abort", stopSession, { once: true });
+          try {
+            await runManagedSession(root, endpoints, {
+              device,
+              workerVersion: VERSION,
+              accessProfile: sessionAccessProfile,
+              ...(keepAwake ? { keepAwake: true } : {}),
+              ...(label ? { workspaceLabel: label } : {}),
+              signal: sessionController.signal,
+              onEvent: (event) => {
+                postExitNotice = retainPostExitNotice(postExitNotice, event);
+                onEvent(event);
+              },
+              quiet: true,
+              handleProcessSignals: false,
+            });
+          } catch (error) {
+            if (signal.aborted) return;
+            if (
+              sessionController.signal.aborted &&
+              requestedAccessProfile !== sessionAccessProfile
+            ) {
+              continue;
+            }
+            throw error;
+          } finally {
+            signal.removeEventListener("abort", stopSession);
+            if (activeSessionController === sessionController) {
+              activeSessionController = undefined;
+            }
+          }
+          if (requestedAccessProfile === sessionAccessProfile) return;
+        }
+      },
+      loadStatus: async (signal) => {
+        const withSignal = async (input: string, init?: RequestInit) =>
+          await fetch(input, { ...init, signal });
+        const devices = (
+          await listDevices(endpoints, `Device ${device.token}`, withSignal)
+        ).filter((entry) => entry.revokedAt === null);
+        return {
+          relay: endpoints.relayOrigin,
+          activeWorkers: devices.some((entry) => entry.activeWorkers === null)
+            ? null
+            : devices.reduce((total, entry) => total + entry.activeWorkers!, 0),
+          devices: devices.map((entry) => ({
+            id: entry.id,
+            name: entry.name,
+            platform: entry.platform ?? "Unknown platform",
+            lastSeen: formatRelativeTime(entry.lastSeenAt),
+            status: deviceStatus(entry),
+            ...(entry.id === device.deviceId ? { current: true } : {}),
+          })),
+        };
+      },
+      revokeDevice: async (deviceId, signal) => {
+        await revokeDevice(
+          endpoints,
+          `Device ${device.token}`,
+          deviceId,
+          async (input, init) => await fetch(input, { ...init, signal }),
+        );
+      },
+      changeAccessProfile: (nextAccessProfile) => {
+        if (nextAccessProfile === requestedAccessProfile) return;
+        requestedAccessProfile = nextAccessProfile;
+        activeSessionController?.abort();
+      },
+    });
+    if (postExitNotice) console.error(postExitNotice);
+  } finally {
+    await lease.release();
+  }
+}
+
+async function refreshUpdateInfo(timeoutMs: number): Promise<UpdateInfo> {
+  const info = await loadUpdateInfo(timeoutMs);
+  await recordUpdateCheck(info);
+  return info;
+}
+
+async function loadUpdateInfo(timeoutMs: number): Promise<UpdateInfo> {
+  const state = await loadUpdateState(VERSION);
+  return await checkForUpdate(VERSION, state.channel, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+async function runUpdateCommand(
+  invocation: Extract<CliInvocation, { command: "update" }>,
+): Promise<void> {
+  if (invocation.action === "configure") {
+    const state = await configureUpdates(VERSION, {
+      ...(invocation.policy ? { policy: invocation.policy } : {}),
+      ...(invocation.channel ? { channel: invocation.channel } : {}),
+    });
+    console.log(
+      `Elix update policy is ${state.policy}; release channel is ${state.channel}.`,
+    );
+    return;
+  }
+
+  const info = await refreshUpdateInfo(15_000);
+  if (!info.updateAvailable) {
+    console.log(`Elix ${VERSION} is current on the ${info.channel} channel.`);
+    return;
+  }
+  if (invocation.action === "check") {
+    console.log(
+      `Elix ${info.availableVersion} is available on the ${info.channel} channel. Run elix update.`,
+    );
+    return;
+  }
+
+  console.log(`Updating Elix ${VERSION} to ${info.availableVersion}...`);
+  await withUpdateLease(
+    async () => await installUpdate(info, DISTRIBUTION),
+  );
+  console.log(`Updated Elix to ${info.availableVersion}. Run elix again.`);
+}
+
+interface WorkspaceUpdateResult {
+  exit: boolean;
+  notice?: string;
+}
+
+async function updateBeforeWorkspace(): Promise<WorkspaceUpdateResult> {
+  const state = await loadUpdateState(VERSION);
+  if (state.policy === "off") return { exit: false };
+  const cachedResult: WorkspaceUpdateResult = {
+    exit: false,
+    ...(state.policy === "notify" && state.availableUpdate ? {
+      notice: `Elix ${state.availableUpdate.availableVersion} is available. Run elix update after disconnecting.`,
+    } : {}),
+  };
+  if (!isUpdateCheckDue(state.lastCheckedAt)) return cachedResult;
+
+  let info: UpdateInfo;
+  try {
+    info = await loadUpdateInfo(2_000);
+  } catch (error) {
+    if (state.policy === "auto") {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `Elix could not check for an automatic update: ${message} Continuing with ${VERSION}.`,
+      );
+    }
+    return cachedResult;
+  }
+  if (!info.updateAvailable) {
+    await recordUpdateCheck(info);
+    return { exit: false };
+  }
+
+  if (state.policy === "notify") {
+    await recordUpdateCheck(info);
+    return {
+      exit: false,
+      notice: `Elix ${info.availableVersion} is available. Run elix update after disconnecting.`,
+    };
+  }
+
+  try {
+    console.error(`Updating Elix ${VERSION} to ${info.availableVersion}...`);
+    await withUpdateLease(
+      async () => await installUpdate(info, DISTRIBUTION),
+    );
+    console.error(`Updated Elix to ${info.availableVersion}. Run elix again.`);
+    return { exit: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      `Elix could not update automatically: ${message} Continuing with ${VERSION}.`,
+    );
+    return { exit: false };
+  }
+}
+
+async function main(): Promise<void> {
+  await cleanupUpdateBackups(DISTRIBUTION);
+  const invocation = parseInvocation(process.argv.slice(2));
+  if (invocation.command === "help") {
+    console.log(HELP);
+  } else if (invocation.command === "version") {
+    console.log(VERSION);
+  } else if (invocation.command === "workspace") {
+    if (invocation.keepAwake && process.platform !== "win32") {
+      throw new UsageError("--keep-awake is currently supported only on Windows.");
+    }
+    // Fail before updates, login or pairing, not after the user has redeemed a code.
+    if (!invocation.headless && (!process.stdin.isTTY || !process.stdout.isTTY)) {
+      throw new Error(INTERACTIVE_TERMINAL_REQUIRED);
+    }
+    const update = await updateBeforeWorkspace();
+    if (update.exit) return;
+    await withWorkspaceLease(() => runWorkspaceSession(invocation, update.notice));
+  } else if (invocation.command === "unpair") {
+    await unpairComputer();
+  } else if (invocation.command === "update") {
+    await runUpdateCommand(invocation);
+  }
+}
+
+main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  if (error instanceof UsageError) console.error("Run elix --help for usage.");
+  process.exitCode = 1;
+});

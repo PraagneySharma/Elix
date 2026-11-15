@@ -1,0 +1,11 @@
+{
+  "name": "@veronica/relay",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Render-only compatibility script for Elix relay deployment",
+  "scripts": {
+    "build": "npm run build --workspace @elix/relay",
+    "migrate": "npm run migrate --workspace @elix/relay",
+    "start": "npm run start --workspace @elix/relay"
+  }
+}

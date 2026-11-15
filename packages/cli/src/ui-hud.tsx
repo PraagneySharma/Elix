@@ -1,0 +1,1780 @@
+import type { ReadStream, WriteStream } from "node:tty";
+import type { WorkerAccessProfile } from "@elix/protocol";
+import { stripVTControlCharacters } from "node:util";
+import { INTERACTIVE_TERMINAL_REQUIRED } from "./worker/managed-session.js";
+import React, {
+  useEffect,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import {
+  Box,
+  Text as InkText,
+  render,
+  renderToString,
+  useInput,
+  useWindowSize,
+} from "ink";
+
+import {
+  applyHudEvent,
+  initialHudState,
+  type HudActivity,
+  type HudDevice,
+  type HudState,
+  type HudUiActions,
+} from "./ui-hud-model.js";
+import {
+  activityCallDetailFields,
+  activityToolTitle,
+  formatActivityCall,
+  type HudActivityMode,
+} from "./ui-hud-activity.js";
+
+const COLORS = {
+  ink: "#f4f1fb",
+  muted: "#aaa4b5",
+  purple: "#ff4fa3",
+  purpleReadable: "#ff9acc",
+  success: "#65d6a6",
+  coral: "#ff665f",
+  line: "#654457",
+} as const;
+
+type InkTextProps = React.ComponentProps<typeof InkText>;
+type HudTextProps = Omit<InkTextProps, "color"> & {
+  color?: InkTextProps["color"] | undefined;
+};
+
+function Text({ color, ...props }: HudTextProps): React.ReactNode {
+  return color === undefined
+    ? <InkText {...props} />
+    : <InkText {...props} color={color} />;
+}
+
+const ACTIVITY_IDLE_REFRESH_INTERVAL_MS = 10_000;
+const ACTIVITY_LIVE_REFRESH_INTERVAL_MS = 1_000;
+const ACTIVITY_SELECTOR_COLUMN_WIDTH = 2;
+const ACTIVITY_STATUS_COLUMN_WIDTH = 2;
+const ACTIVITY_TOOL_COLUMN_WIDTH = 15;
+const ACTIVITY_AGE_COLUMN_WIDTH = 10;
+const ACTIVITY_PREAMBLE_LINES = 1;
+
+interface HudHint {
+  key: string;
+  label: string;
+  labelWidth?: number;
+  tone?: string;
+}
+
+interface HudFooterRow {
+  left: HudHint[];
+  right: HudHint[];
+}
+
+interface HudScreenMetrics {
+  usable: number;
+  bodyBudget: number;
+  footerRows: HudFooterRow[];
+  overlayRows: number;
+}
+
+class HudStore {
+  #state: HudState;
+  #listeners = new Set<() => void>();
+
+  constructor(workspace: string, initialNotice?: string) {
+    this.#state = {
+      ...initialHudState(workspace),
+      ...(initialNotice ? { notice: initialNotice } : {}),
+    };
+  }
+
+  getSnapshot = (): HudState => this.#state;
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  };
+
+  update(update: (state: HudState) => HudState): void {
+    const next = update(this.#state);
+    if (next === this.#state) return;
+    this.#state = next;
+    for (const listener of this.#listeners) listener();
+  }
+
+  event(event: Parameters<typeof applyHudEvent>[1]): void {
+    this.update((state) => applyHudEvent(state, event));
+  }
+}
+
+function terminalTitleSequence(label: string | undefined): string {
+  const safeLabel = label?.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+  return `\u001b]0;${safeLabel ? `Elix | ${safeLabel}` : "Elix"}\u0007`;
+}
+
+function connectionLabel(state: HudState): string {
+  if (state.connection === "connected") return "Connected";
+  if (state.connection === "connecting" || state.connection === "starting") {
+    return "Connecting";
+  }
+  if (state.connection === "retrying") return "Reconnecting";
+  if (state.connection === "error") return "Error";
+  return "Disconnected";
+}
+
+function liveDuration(elapsedMs: number): string {
+  const seconds = Math.floor(Math.max(0, elapsedMs) / 1_000);
+  if (seconds < 1) return "now";
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function activityAge(activity: HudActivity, now: number): string {
+  if (activity.state === "working") {
+    const startedAt = activity.startedAt ?? activity.updatedAt;
+    return startedAt === undefined ? "now" : liveDuration(now - startedAt);
+  }
+  if (activity.updatedAt === undefined) return "";
+  const elapsedMs = Math.max(0, now - activity.updatedAt);
+  if (elapsedMs < 10_000) return "just now";
+  if (elapsedMs < 60_000) return `${Math.floor(elapsedMs / 1_000)}s ago`;
+  if (elapsedMs < 3_600_000) return `${Math.floor(elapsedMs / 60_000)}m ago`;
+  if (elapsedMs < 86_400_000) return `${Math.floor(elapsedMs / 3_600_000)}h ago`;
+  return `${Math.floor(elapsedMs / 86_400_000)}d ago`;
+}
+
+function activityStatus(activity: HudActivity): { symbol: string; tone: string } {
+  if (activity.state === "failed") return { symbol: "×", tone: COLORS.coral };
+  if (activity.state === "working") return { symbol: "○", tone: COLORS.purpleReadable };
+  return { symbol: "✓", tone: COLORS.success };
+}
+
+function activitySummary(activity: HudActivity): string {
+  return [activity.summary.target, ...activity.summary.details].join(" · ");
+}
+
+function selectedActivity(state: HudState): HudActivity | undefined {
+  if (!state.activitySelection) return undefined;
+  return state.activities.find((activity) => activity.requestId === state.activitySelection);
+}
+
+function selectedActivityIndex(state: HudState): number {
+  const selected = selectedActivity(state);
+  return selected
+    ? state.activities.findIndex((activity) => activity.requestId === selected.requestId)
+    : -1;
+}
+
+function sectionLabel(value: string): string {
+  return value.toUpperCase();
+}
+
+const ACCESS_PROFILES: WorkerAccessProfile[] = ["read-only", "workspace", "system"];
+
+function accessProfileLabel(accessProfile: WorkerAccessProfile): string {
+  return accessProfile === "read-only"
+    ? "Read only"
+    : accessProfile === "workspace"
+      ? "Workspace"
+      : "System";
+}
+
+function adjacentAccessProfile(
+  accessProfile: WorkerAccessProfile,
+  direction: -1 | 1,
+): WorkerAccessProfile | undefined {
+  const index = ACCESS_PROFILES.indexOf(accessProfile);
+  return ACCESS_PROFILES[index + direction];
+}
+
+function accessProfileCapabilities(accessProfile: WorkerAccessProfile): {
+  summary: string;
+  detail: string;
+} {
+  if (accessProfile === "read-only") {
+    return { summary: "read files", detail: "No writes · no commands" };
+  }
+  if (accessProfile === "workspace") {
+    return { summary: "read + write files", detail: "Commands off" };
+  }
+  return {
+    summary: "read + write files + commands",
+    detail: "OS permissions · credentials · network",
+  };
+}
+
+function primaryFooterHints(state: HudState): HudHint[] {
+  if (state.prompt) return [];
+  if (state.busy) return [{ key: "Q", label: "Quit", tone: COLORS.coral }];
+  return [
+    { key: "A", label: "Activity" },
+    { key: "W", label: "Workspace" },
+    { key: "D", label: "Devices" },
+    { key: "Q", label: "Quit", tone: COLORS.coral },
+  ];
+}
+
+function contextualFooterHints(
+  state: HudState,
+  usable: number,
+  bodyBudget: number,
+): HudHint[] {
+  if (state.prompt || state.busy) return [];
+  if (state.view === "activity") {
+    if (state.activities.length === 0) return [];
+    const density = {
+      key: "Tab",
+      label: state.activityMode === "compact" ? "Detailed" : "Compact",
+      labelWidth: "Detailed".length,
+    };
+    if (state.activitySelection) {
+      return [
+        density,
+        { key: "↑↓", label: "Select" },
+        { key: "Enter", label: "Inspect" },
+        { key: "Esc", label: "Browse" },
+      ];
+    }
+    const window = activityBrowseWindow(state, bodyBudget);
+    return [
+      density,
+      ...(window.start > 0 ? [{ key: "↑", label: "Older" }] : []),
+      ...(window.end < state.activities.length ? [{ key: "↓", label: "Newer" }] : []),
+      ...(window.end > window.start ? [{ key: "Enter", label: "Select" }] : []),
+    ];
+  }
+  if (state.view === "activity-detail") {
+    const maxScroll = activityDetailMaxScroll(state, usable, bodyBudget, Date.now());
+    const hiddenBelow = Math.max(0, maxScroll - state.activityDetailScroll);
+    return [
+      ...(hiddenBelow > 0 ? [{ key: "↓", label: `${hiddenBelow} more` }] : []),
+      { key: "Esc", label: "Back" },
+    ];
+  }
+  if (
+    state.view === "devices" &&
+    (state.status?.devices.length ?? 0) > 0 &&
+    statusDeviceCapacity(state, bodyBudget, usable) > 0
+  ) {
+    return [
+      { key: "↑↓", label: "Select" },
+      { key: "Enter", label: "Revoke", tone: COLORS.coral },
+    ];
+  }
+  if (
+    state.view === "workspace" &&
+    state.connection === "connected" &&
+    state.accessProfile &&
+    !state.pendingAccessProfile
+  ) {
+    const lower = adjacentAccessProfile(state.accessProfile, -1);
+    const higher = adjacentAccessProfile(state.accessProfile, 1);
+    return [
+      ...(lower ? [{ key: "←", label: accessProfileLabel(lower) }] : []),
+      ...(higher
+        ? [{ key: "→", label: accessProfileLabel(higher), tone: COLORS.coral }]
+        : []),
+    ];
+  }
+  return [];
+}
+
+function footerHintWidth(hint: HudHint): number {
+  return hint.key.length + Math.max(hint.label.length, hint.labelWidth ?? 0) + 1;
+}
+
+function footerHintsWidth(hints: HudHint[]): number {
+  if (hints.length === 0) return 0;
+  return hints.reduce((total, hint) => total + footerHintWidth(hint), 0) +
+    (hints.length - 1) * 3;
+}
+
+function splitFooterHints(hints: HudHint[], usable: number): HudHint[][] {
+  if (hints.length === 0) return [];
+  const rows: HudHint[][] = [[]];
+  let rowLength = 0;
+  for (const hint of hints) {
+    const tokenLength = footerHintWidth(hint);
+    if (rows.at(-1)!.length > 0 && rowLength + 3 + tokenLength > usable) {
+      rows.push([]);
+      rowLength = 0;
+    }
+    rows.at(-1)!.push(hint);
+    rowLength += (rowLength > 0 ? 3 : 0) + tokenLength;
+  }
+  return rows;
+}
+
+function buildFooterRows(
+  state: HudState,
+  usable: number,
+  bodyBudget: number,
+): HudFooterRow[] {
+  const rows = splitFooterHints(primaryFooterHints(state), usable).map((left) => ({
+    left,
+    right: [] as HudHint[],
+  }));
+  const contextualRows = splitFooterHints(
+    contextualFooterHints(state, usable, bodyBudget),
+    usable,
+  );
+  if (contextualRows.length === 0) return rows;
+  if (rows.length === 0) {
+    return contextualRows.map((right) => ({ left: [], right }));
+  }
+
+  const firstContextual = contextualRows[0]!;
+  const lastPrimary = rows.at(-1)!;
+  const combinedWidth = footerHintsWidth(lastPrimary.left) + 3 +
+    footerHintsWidth(firstContextual);
+  if (combinedWidth <= usable) {
+    lastPrimary.right = firstContextual;
+    contextualRows.slice(1).forEach((right) => rows.push({ left: [], right }));
+  } else {
+    contextualRows.forEach((right) => rows.push({ left: [], right }));
+  }
+  return rows;
+}
+
+interface HudOverlayContent {
+  lines: string[];
+  choices?: string;
+  tone: string;
+  bold: boolean;
+}
+
+function wrapOverlayText(value: string, width: number): string[] {
+  if (width <= 0) return [""];
+  const words = value.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [""];
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    if (!line) {
+      line = word;
+      continue;
+    }
+    if (`${line} ${word}`.length <= width) {
+      line += ` ${word}`;
+      continue;
+    }
+    lines.push(line);
+    line = word;
+  }
+  if (line) lines.push(line);
+  return lines.flatMap((part) => {
+    if (part.length <= width) return [part];
+    const chunks: string[] = [];
+    for (let index = 0; index < part.length; index += width) {
+      chunks.push(part.slice(index, index + width));
+    }
+    return chunks;
+  });
+}
+
+function overlayContent(state: HudState, usable: number): HudOverlayContent | undefined {
+  if (state.busy) {
+    return {
+      lines: wrapOverlayText(state.busyMessage ?? "Working…", usable),
+      tone: COLORS.purpleReadable,
+      bold: true,
+    };
+  }
+  if (state.prompt?.type === "access-confirm") {
+    const warning = state.prompt.accessProfile === "system"
+      ? "Commands use this OS account's permissions, environment, credentials, and network."
+      : "Allows guarded file writes inside this workspace.";
+    return {
+      lines: [
+        ...wrapOverlayText(`Increase access to ${accessProfileLabel(state.prompt.accessProfile)}?`, usable),
+        ...wrapOverlayText(warning, usable),
+      ],
+      choices: "Y Confirm   N Cancel",
+      tone: COLORS.coral,
+      bold: true,
+    };
+  }
+  if (state.prompt?.type === "revoke-confirm") {
+    const device = state.status?.devices[state.prompt.deviceIndex];
+    return {
+      lines: wrapOverlayText(`Revoke ${device?.name ?? "this device"}?`, usable),
+      choices: "Y Confirm   N Cancel",
+      tone: COLORS.coral,
+      bold: true,
+    };
+  }
+  if (!state.notice) return undefined;
+  const tone = state.noticeTone === "error"
+    ? COLORS.coral
+    : state.noticeTone === "success"
+      ? COLORS.success
+      : COLORS.purpleReadable;
+  return {
+    lines: wrapOverlayText(state.notice, usable),
+    tone,
+    bold: false,
+  };
+}
+
+function screenMetrics(state: HudState, columns: number, rows: number): HudScreenMetrics {
+  const margin = columns >= 24 ? 2 : 0;
+  const usable = Math.max(8, columns - margin * 2);
+  const terminalRows = Math.max(6, rows);
+  const overlay = overlayContent(state, usable);
+  const overlayRows = overlay
+    ? 1 + overlay.lines.length + (overlay.choices ? 1 : 0)
+    : 0;
+  let bodyBudget = Math.max(0, terminalRows - 2 - overlayRows - 1);
+  let footerRows: HudFooterRow[] = [];
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    const nextFooterRows = buildFooterRows(state, usable, bodyBudget);
+    const nextBodyBudget = Math.max(
+      0,
+      terminalRows - 2 - overlayRows - 1 - nextFooterRows.length,
+    );
+    footerRows = nextFooterRows;
+    if (nextBodyBudget === bodyBudget) break;
+    bodyBudget = nextBodyBudget;
+  }
+  return { usable, bodyBudget, footerRows, overlayRows };
+}
+
+function activityListCapacity(bodyBudget: number): number {
+  return Math.max(0, bodyBudget - ACTIVITY_PREAMBLE_LINES);
+}
+
+function activityBrowseWindow(state: HudState, bodyBudget: number): {
+  capacity: number;
+  start: number;
+  end: number;
+} {
+  const capacity = activityListCapacity(bodyBudget);
+  const total = state.activities.length;
+  if (capacity <= 0 || total === 0) return { capacity, start: 0, end: 0 };
+
+  let end = total;
+  if (state.activityBrowseAnchor) {
+    const anchorIndex = state.activities.findIndex(
+      (activity) => activity.requestId === state.activityBrowseAnchor,
+    );
+    end = anchorIndex >= 0 ? anchorIndex + 1 : Math.min(total, capacity);
+  }
+  return {
+    capacity,
+    start: Math.max(0, end - capacity),
+    end,
+  };
+}
+
+function activityWindow(state: HudState, bodyBudget: number): {
+  capacity: number;
+  selection: number;
+  start: number;
+  end: number;
+} {
+  const browsing = activityBrowseWindow(state, bodyBudget);
+  const selection = selectedActivityIndex(state);
+  if (
+    selection < 0 ||
+    browsing.capacity <= 0 ||
+    (selection >= browsing.start && selection < browsing.end)
+  ) {
+    return { ...browsing, selection };
+  }
+  const total = state.activities.length;
+  const maxStart = Math.max(0, total - browsing.capacity);
+  const centered = selection - Math.floor(browsing.capacity / 2);
+  const start = Math.min(maxStart, Math.max(0, centered));
+  return {
+    capacity: browsing.capacity,
+    selection,
+    start,
+    end: Math.min(total, start + browsing.capacity),
+  };
+}
+
+function activityBrowseAnchorForEnd(
+  activities: HudActivity[],
+  end: number,
+): string | undefined {
+  if (end >= activities.length) return undefined;
+  return end > 0 ? activities[end - 1]?.requestId : undefined;
+}
+
+function activityCenterSelection(state: HudState, bodyBudget: number): string | undefined {
+  const { start, end } = activityBrowseWindow(state, bodyBudget);
+  if (end <= start) return undefined;
+  const index = start + Math.floor((end - start) / 2);
+  return state.activities[index]?.requestId;
+}
+
+function activityPageUpdate(
+  state: HudState,
+  bodyBudget: number,
+  direction: "older" | "newer",
+): { activityBrowseAnchor: string | undefined } | undefined {
+  const window = activityBrowseWindow(state, bodyBudget);
+  if (window.capacity <= 0) return undefined;
+  if (direction === "older") {
+    if (window.start <= 0) return undefined;
+    return {
+      activityBrowseAnchor: activityBrowseAnchorForEnd(state.activities, window.start),
+    };
+  }
+  if (window.end >= state.activities.length) return undefined;
+  const end = Math.min(state.activities.length, window.end + window.capacity);
+  return {
+    activityBrowseAnchor: activityBrowseAnchorForEnd(state.activities, end),
+  };
+}
+
+function activitySelectionUpdate(
+  state: HudState,
+  bodyBudget: number,
+  direction: -1 | 1,
+): {
+  activitySelection: string;
+  activityBrowseAnchor: string | undefined;
+} | undefined {
+  const currentIndex = selectedActivityIndex(state);
+  if (currentIndex < 0) return undefined;
+  const targetIndex = Math.min(
+    state.activities.length - 1,
+    Math.max(0, currentIndex + direction),
+  );
+  if (targetIndex === currentIndex) return undefined;
+
+  const window = activityWindow(state, bodyBudget);
+  let activityBrowseAnchor = state.activityBrowseAnchor;
+  if (targetIndex < window.start) {
+    activityBrowseAnchor = activityBrowseAnchorForEnd(state.activities, window.start);
+  } else if (targetIndex >= window.end) {
+    const end = Math.min(state.activities.length, window.end + window.capacity);
+    activityBrowseAnchor = activityBrowseAnchorForEnd(state.activities, end);
+  }
+  return {
+    activitySelection: state.activities[targetIndex]!.requestId,
+    activityBrowseAnchor,
+  };
+}
+
+function statusDeviceCapacity(state: HudState, bodyBudget: number, usable: number): number {
+  if (!state.status || state.statusLoading || state.status.devices.length === 0) return 0;
+  const preamble = usable >= 64 ? 2 : 1;
+  return Math.min(9, state.status.devices.length, Math.max(0, bodyBudget - preamble));
+}
+
+function deviceListWindow(state: HudState, bodyBudget: number, usable: number): {
+  capacity: number;
+  selection: number;
+  start: number;
+  end: number;
+} {
+  const capacity = statusDeviceCapacity(state, bodyBudget, usable);
+  const total = state.status?.devices.length ?? 0;
+  const selection = total === 0
+    ? 0
+    : Math.min(Math.max(0, state.deviceSelection), total - 1);
+  if (capacity <= 0) return { capacity, selection, start: 0, end: 0 };
+  const maxStart = Math.max(0, total - capacity);
+  const start = Math.min(maxStart, Math.max(0, selection - capacity + 1));
+  return {
+    capacity,
+    selection,
+    start,
+    end: Math.min(total, start + capacity),
+  };
+}
+
+function Line({ usable, color }: { usable: number; color: boolean }): React.ReactNode {
+  return (
+    <Text color={color ? COLORS.line : undefined} wrap="truncate">
+      {"─".repeat(usable)}
+    </Text>
+  );
+}
+
+function Header({ state, usable, bodyBudget, color }: {
+  state: HudState;
+  usable: number;
+  bodyBudget: number;
+  color: boolean;
+}): React.ReactNode {
+  const statusColor = state.connection === "error" ? COLORS.coral : COLORS.purpleReadable;
+  const selected = selectedActivity(state);
+  const pageTitle = state.view === "activity"
+    ? "Activity"
+    : state.view === "activity-detail"
+      ? `Activity / ${selected ? activityToolTitle(selected.tool) : "Call"}`
+      : state.view === "devices"
+        ? "Devices"
+        : "Workspace";
+  const activityListWindow = state.view === "activity"
+    ? activityWindow(state, bodyBudget)
+    : undefined;
+  const activityRange = activityListWindow &&
+      activityListWindow.capacity > 0 && state.activities.length > activityListWindow.capacity
+    ? ` (${activityListWindow.start + 1}-${activityListWindow.end}/${state.activities.length})`
+    : "";
+  const deviceWindow = state.view === "devices"
+    ? deviceListWindow(state, bodyBudget, usable)
+    : undefined;
+  const deviceRange = deviceWindow && state.status &&
+      deviceWindow.capacity > 0 && state.status.devices.length > deviceWindow.capacity
+    ? ` (${deviceWindow.start + 1}-${deviceWindow.end}/${state.status.devices.length})`
+    : "";
+  return (
+    <Box flexDirection="column" height={2} flexShrink={0}>
+      <Box width={usable}>
+        <Box flexGrow={1} flexShrink={1}>
+          <Text wrap="truncate">
+            <Text bold color={color ? COLORS.purple : undefined}>Elix</Text>
+            {pageTitle ? (
+              <>
+                <Text color={color ? COLORS.muted : undefined}> / </Text>
+                <Text bold color={color ? COLORS.purpleReadable : undefined}>{pageTitle}</Text>
+                {activityRange || deviceRange ? (
+                  <Text color={color ? COLORS.muted : undefined}>{activityRange || deviceRange}</Text>
+                ) : null}
+              </>
+            ) : null}
+          </Text>
+        </Box>
+        <Box marginLeft={1} flexShrink={0}>
+          <Text bold color={color ? statusColor : undefined}>{connectionLabel(state)}</Text>
+        </Box>
+      </Box>
+      <Line usable={usable} color={color} />
+    </Box>
+  );
+}
+
+function SectionTitle({ children, color, tone = COLORS.purpleReadable }: {
+  children: string;
+  color: boolean;
+  tone?: string;
+}): React.ReactNode {
+  return <Text bold color={color ? tone : undefined}>{sectionLabel(children)}</Text>;
+}
+
+function Blank(): React.ReactNode {
+  return <Box height={1} />;
+}
+
+function WorkspaceFact({ label, value, usable, color, tone, hint }: {
+  label: string;
+  value: string;
+  usable: number;
+  color: boolean;
+  tone?: string;
+  hint?: HudHint | undefined;
+}): React.ReactNode {
+  const labelWidth = Math.min(10, Math.max(7, Math.floor(usable * 0.16)));
+  return (
+    <Box width={usable} height={1} flexShrink={0}>
+      <Box width={labelWidth} flexShrink={0}>
+        <Text color={color ? COLORS.muted : undefined}>{label}</Text>
+      </Box>
+      <Box flexGrow={1} flexShrink={1}>
+        <Text color={color ? (tone ?? COLORS.ink) : undefined} wrap="truncate">
+          {value}
+        </Text>
+      </Box>
+      {hint && usable >= 40 ? (
+        <Box marginLeft={2} flexShrink={0}>
+          <Text bold color={color ? (hint.tone ?? COLORS.purpleReadable) : undefined}>
+            {hint.key}
+          </Text>
+          <Text color={color ? COLORS.muted : undefined}>{` ${hint.label}`}</Text>
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function WorkspaceActivityHeader({ usable, color }: {
+  usable: number;
+  color: boolean;
+}): React.ReactNode {
+  return (
+    <Box width={usable}>
+      <Box flexGrow={1} flexShrink={1}>
+        <SectionTitle color={color}>Activity</SectionTitle>
+      </Box>
+      {usable >= 32 ? (
+        <Box marginLeft={2} flexShrink={0}>
+          <Text bold color={color ? COLORS.purpleReadable : undefined}>A</Text>
+          <Text color={color ? COLORS.muted : undefined}> View all</Text>
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function activityLayout(usable: number, selectable: boolean): {
+  toolWidth: number;
+  showSummary: boolean;
+  showAge: boolean;
+  summaryWidth: number;
+} {
+  const selectorWidth = selectable ? ACTIVITY_SELECTOR_COLUMN_WIDTH : 0;
+  const leadingWidth = selectorWidth + ACTIVITY_STATUS_COLUMN_WIDTH;
+  const toolWidth = Math.min(
+    ACTIVITY_TOOL_COLUMN_WIDTH,
+    Math.max(0, usable - leadingWidth),
+  );
+  const showSummary = usable >= leadingWidth + toolWidth + 5;
+  const showAge = usable >= leadingWidth + toolWidth + ACTIVITY_AGE_COLUMN_WIDTH + 10;
+  const summaryWidth = Math.max(
+    0,
+    usable - leadingWidth - toolWidth - (showSummary ? 2 : 0) -
+      (showAge ? ACTIVITY_AGE_COLUMN_WIDTH + 2 : 0),
+  );
+  return { toolWidth, showSummary, showAge, summaryWidth };
+}
+
+function WorkspaceView({ state, usable, bodyBudget, color, now }: {
+  state: HudState;
+  usable: number;
+  bodyBudget: number;
+  color: boolean;
+  now: number;
+}): React.ReactNode {
+  const showConnectionMessage = Boolean(
+    state.message && (state.connection === "retrying" || state.connection === "error"),
+  );
+  const hasFacts = Boolean(state.deviceName || state.accessProfile);
+  let fixedLines = 2;
+  if (hasFacts) fixedLines += 1;
+  if (state.deviceName) fixedLines += 1;
+  if (state.accessProfile) fixedLines += 2;
+  if (showConnectionMessage) fixedLines += 2;
+  const activityCapacity = !state.prompt && !state.busy && state.activities.length > 0
+    ? Math.min(3, Math.max(0, bodyBudget - fixedLines - 3))
+    : 0;
+  const activityPreview = activityCapacity > 0
+    ? state.activities.slice(-activityCapacity)
+    : [];
+  const accessHint = state.connection === "connected" &&
+      state.accessProfile &&
+      !state.pendingAccessProfile &&
+      !state.prompt &&
+      !state.busy
+    ? (() => {
+        const lower = adjacentAccessProfile(state.accessProfile, -1);
+        const higher = adjacentAccessProfile(state.accessProfile, 1);
+        return {
+          key: lower && higher ? "←/→" : lower ? "←" : "→",
+          label: "Switch",
+        };
+      })()
+    : undefined;
+
+  return (
+    <Box height={bodyBudget} flexDirection="column" flexShrink={0} overflow="hidden">
+      <Blank />
+      <Text color={color ? COLORS.ink : undefined} wrap="truncate-middle">{state.workspace}</Text>
+      {hasFacts ? <Blank /> : null}
+      {state.deviceName ? (
+        <WorkspaceFact
+          label="Device"
+          value={state.deviceName}
+          usable={usable}
+          color={color}
+        />
+      ) : null}
+      {state.accessProfile ? (
+        <>
+          <WorkspaceFact
+            label="Access"
+            value={`${accessProfileLabel(state.accessProfile)} · ${accessProfileCapabilities(state.accessProfile).summary}`}
+            usable={usable}
+            color={color}
+            hint={accessHint}
+          />
+          <WorkspaceFact
+            label=""
+            value={accessProfileCapabilities(state.accessProfile).detail}
+            usable={usable}
+            color={color}
+          />
+        </>
+      ) : null}
+      {showConnectionMessage ? (
+        <>
+          <Blank />
+          <Text color={color ? COLORS.coral : undefined} wrap="wrap">{state.message}</Text>
+        </>
+      ) : null}
+      {activityCapacity > 0 ? (
+        <>
+          <Blank />
+          <Line usable={usable} color={color} />
+          <Blank />
+          <WorkspaceActivityHeader usable={usable} color={color} />
+          {activityPreview.map((activity) => (
+            <ActivityRow
+              key={activity.requestId}
+              activity={activity}
+              usable={usable}
+              color={color}
+              now={now}
+            />
+          ))}
+        </>
+      ) : null}
+    </Box>
+  );
+}
+
+function ActivityRow({
+  activity,
+  usable,
+  color,
+  now,
+  selectable = false,
+  selected = false,
+  mode = "compact",
+}: {
+  activity: HudActivity;
+  usable: number;
+  color: boolean;
+  now: number;
+  selectable?: boolean;
+  selected?: boolean;
+  mode?: HudActivityMode;
+}): React.ReactNode {
+  const { toolWidth, showSummary, showAge, summaryWidth } = activityLayout(usable, selectable);
+  const age = activityAge(activity, now);
+  const status = activityStatus(activity);
+  const summary = activity.call
+    ? formatActivityCall(activity.call, mode, summaryWidth)
+    : mode === "compact"
+      ? activity.compactSummary ?? activitySummary(activity)
+      : activitySummary(activity);
+  return (
+    <Box width={usable} height={1} flexShrink={0}>
+      {selectable ? (
+        <Box width={ACTIVITY_SELECTOR_COLUMN_WIDTH} flexShrink={0}>
+          <Text bold color={color ? COLORS.purpleReadable : undefined}>{selected ? "›" : " "}</Text>
+        </Box>
+      ) : null}
+      <Box width={ACTIVITY_STATUS_COLUMN_WIDTH} flexShrink={0}>
+        <Text bold color={color ? status.tone : undefined}>{status.symbol}</Text>
+      </Box>
+      <Box width={toolWidth} flexShrink={0}>
+        <Text
+          bold
+          color={color ? (selected ? COLORS.purpleReadable : COLORS.ink) : undefined}
+          wrap="truncate"
+        >
+          {activity.tool}
+        </Text>
+      </Box>
+      {showSummary ? (
+        <Box marginLeft={2} flexGrow={1} flexShrink={1}>
+          <Text color={color ? COLORS.muted : undefined} wrap="truncate">
+            {summary}
+          </Text>
+        </Box>
+      ) : null}
+      {showAge ? (
+        <Box
+          width={ACTIVITY_AGE_COLUMN_WIDTH}
+          marginLeft={2}
+          flexShrink={0}
+          justifyContent="flex-end"
+        >
+          <Text color={color ? COLORS.muted : undefined}>{age}</Text>
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function ActivityView({ state, usable, bodyBudget, color, now }: {
+  state: HudState;
+  usable: number;
+  bodyBudget: number;
+  color: boolean;
+  now: number;
+}): React.ReactNode {
+  const window = activityWindow(state, bodyBudget);
+  const visible = window.capacity > 0
+    ? state.activities.slice(window.start, window.end)
+    : [];
+  const selection = selectedActivity(state)?.requestId;
+
+  return (
+    <Box height={bodyBudget} flexDirection="column" flexShrink={0} overflow="hidden">
+      <Blank />
+      {state.activities.length === 0 ? (
+        <Text color={color ? COLORS.muted : undefined}>No activity yet.</Text>
+      ) : visible.map((activity) => (
+        <ActivityRow
+          key={activity.requestId}
+          activity={activity}
+          usable={usable}
+          color={color}
+          now={now}
+          selectable
+          selected={activity.requestId === selection}
+          mode={state.activityMode}
+        />
+      ))}
+    </Box>
+  );
+}
+
+interface HudDetailLine {
+  section?: string;
+  separator?: boolean;
+  fullWidth?: boolean;
+  label?: string;
+  value?: string;
+  tone?: string;
+  bold?: boolean;
+}
+
+function wrapDetailValue(value: string, width: number): string[] {
+  if (width <= 0) return [""];
+  const characters = Array.from(value);
+  if (characters.length <= width) return [value];
+  const lines: string[] = [];
+  let remaining = characters;
+  while (remaining.length > width) {
+    let cut = width;
+    for (let index = width - 1; index >= Math.floor(width * 0.55); index -= 1) {
+      if (remaining[index] === " ") {
+        cut = index;
+        break;
+      }
+    }
+    lines.push(remaining.slice(0, cut).join(""));
+    remaining = remaining.slice(cut);
+    while (remaining[0] === " ") remaining = remaining.slice(1);
+  }
+  if (remaining.length > 0) lines.push(remaining.join(""));
+  return lines;
+}
+
+function detailFieldLines(label: string, value: string, usable: number): HudDetailLine[] {
+  const labelWidth = Math.min(14, Math.max(8, Math.floor(usable * 0.3)));
+  const valueWidth = Math.max(1, usable - labelWidth);
+  return wrapDetailValue(value, valueWidth).map((part, index) => ({
+    label: index === 0 ? label : "",
+    value: part,
+  }));
+}
+
+function activityInspectOutputLines(activity: HudActivity, usable: number): HudDetailLine[] {
+  const preview = activity.output?.preview;
+  if (!preview) return [];
+  const tone = activity.output?.kind === "error" ? COLORS.coral : undefined;
+  const lines: HudDetailLine[] = [];
+  for (const part of preview.split("\n")) {
+    for (const wrapped of wrapDetailValue(part || " ", usable)) {
+      lines.push({ value: wrapped, fullWidth: true, ...(tone ? { tone } : {}) });
+    }
+  }
+  return lines;
+}
+
+function formatClock(timestamp: number): string {
+  const date = new Date(timestamp);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+}
+
+function activityInspectLines(activity: HudActivity, usable: number, now: number): HudDetailLine[] {
+  const lines: HudDetailLine[] = [{}];
+  if (activity.call) {
+    for (const field of activityCallDetailFields(activity.call)) {
+      lines.push(...detailFieldLines(field.label, field.value, usable));
+    }
+  } else {
+    const reason = activity.callUnavailable === "oversized"
+      ? "Full invocation metadata exceeded the local Activity detail budget and was not retained."
+      : "Full invocation metadata has expired from the local Activity detail budget; the compact history remains available.";
+    lines.push(...detailFieldLines("details", reason, usable));
+  }
+  if (activity.startedAt !== undefined) {
+    lines.push(...detailFieldLines("started", formatClock(activity.startedAt), usable));
+    const end = activity.state === "working" ? now : activity.updatedAt ?? now;
+    lines.push(...detailFieldLines("duration", liveDuration(end - activity.startedAt), usable));
+  }
+  lines.push({}, { separator: true }, {}, { section: "Output" });
+  lines.push(...activityInspectOutputLines(activity, usable));
+  return lines;
+}
+
+function ActivityDetailLine({ line, usable, color }: {
+  line: HudDetailLine;
+  usable: number;
+  color: boolean;
+}): React.ReactNode {
+  if (line.section) return <SectionTitle color={color}>{line.section}</SectionTitle>;
+  if (line.separator) return <Line usable={usable} color={color} />;
+  if (line.fullWidth) {
+    return (
+      <Text
+        bold={Boolean(line.bold)}
+        color={color ? (line.tone ?? COLORS.ink) : undefined}
+        wrap="truncate"
+      >
+        {line.value ?? ""}
+      </Text>
+    );
+  }
+  if (line.label === undefined && line.value === undefined) return <Blank />;
+  const labelWidth = Math.min(14, Math.max(8, Math.floor(usable * 0.3)));
+  return (
+    <Box width={usable} height={1} flexShrink={0}>
+      <Box width={labelWidth} flexShrink={0}>
+        <Text color={color ? COLORS.muted : undefined}>{line.label ?? ""}</Text>
+      </Box>
+      <Text
+        bold={Boolean(line.bold)}
+        color={color ? (line.tone ?? COLORS.ink) : undefined}
+        wrap="truncate"
+      >
+        {line.value ?? ""}
+      </Text>
+    </Box>
+  );
+}
+
+function ActivityDetailView({ state, usable, bodyBudget, color, now }: {
+  state: HudState;
+  usable: number;
+  bodyBudget: number;
+  color: boolean;
+  now: number;
+}): React.ReactNode {
+  const activity = selectedActivity(state);
+  if (!activity) {
+    return (
+      <Box height={bodyBudget} flexDirection="column" flexShrink={0} overflow="hidden">
+        <Blank />
+        <Text color={color ? COLORS.muted : undefined}>No activity selected.</Text>
+      </Box>
+    );
+  }
+  const lines = activityInspectLines(activity, usable, now);
+  const maxScroll = Math.max(0, lines.length - bodyBudget);
+  const scroll = Math.min(state.activityDetailScroll, maxScroll);
+  const visible = lines.slice(scroll, scroll + bodyBudget);
+
+  return (
+    <Box height={bodyBudget} flexDirection="column" flexShrink={0} overflow="hidden">
+      {visible.map((line, index) => (
+        <ActivityDetailLine key={`${scroll}-${index}`} line={line} usable={usable} color={color} />
+      ))}
+    </Box>
+  );
+}
+
+function activityDetailMaxScroll(state: HudState, usable: number, bodyBudget: number, now: number): number {
+  const activity = selectedActivity(state);
+  if (!activity) return 0;
+  return Math.max(0, activityInspectLines(activity, usable, now).length - bodyBudget);
+}
+
+function DeviceRow({ device, selected, usable, color }: {
+  device: HudDevice;
+  selected: boolean;
+  usable: number;
+  color: boolean;
+}): React.ReactNode {
+  const active = device.status.includes("active");
+  const tone = active ? COLORS.purpleReadable : COLORS.muted;
+  const selector = selected ? "›" : " ";
+  const name = device.current ? `${device.name} · this device` : device.name;
+  if (usable < 64) {
+    return (
+      <Box width={usable}>
+        <Box width={2} flexShrink={0}>
+          <Text bold color={color ? COLORS.purpleReadable : undefined}>{selector}</Text>
+        </Box>
+        <Text
+          bold={selected}
+          color={color ? (selected ? COLORS.purpleReadable : tone) : undefined}
+          wrap="truncate"
+        >
+          {`${name} · ${device.status} · ${device.platform} · ${device.lastSeen}`}
+        </Text>
+      </Box>
+    );
+  }
+  return (
+    <Box width={usable}>
+      <Box width={2} flexShrink={0}>
+        <Text bold color={color ? COLORS.purpleReadable : undefined}>{selector}</Text>
+      </Box>
+      <Box flexGrow={1} flexShrink={1}>
+        <Text
+          bold={selected}
+          color={color ? (selected ? COLORS.purpleReadable : COLORS.ink) : undefined}
+          wrap="truncate"
+        >
+          {name}
+        </Text>
+      </Box>
+      <Box width={20} flexShrink={0}>
+        <Text color={color ? tone : undefined} wrap="truncate">{device.status}</Text>
+      </Box>
+      <Box width={14} flexShrink={0}>
+        <Text color={color ? COLORS.muted : undefined} wrap="truncate">{device.platform}</Text>
+      </Box>
+      <Box width={14} flexShrink={0}>
+        <Text color={color ? COLORS.muted : undefined} wrap="truncate">{device.lastSeen}</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function DeviceHeading({ usable, color }: { usable: number; color: boolean }): React.ReactNode {
+  if (usable < 64) return null;
+  return (
+    <Box width={usable}>
+      <Box width={2} />
+      <Box flexGrow={1}><Text color={color ? COLORS.muted : undefined}>Device</Text></Box>
+      <Box width={20}><Text color={color ? COLORS.muted : undefined}>Workspaces</Text></Box>
+      <Box width={14}><Text color={color ? COLORS.muted : undefined}>Platform</Text></Box>
+      <Box width={14}><Text color={color ? COLORS.muted : undefined}>Last seen</Text></Box>
+    </Box>
+  );
+}
+
+function DevicesView({ state, usable, bodyBudget, color }: {
+  state: HudState;
+  usable: number;
+  bodyBudget: number;
+  color: boolean;
+}): React.ReactNode {
+  const window = deviceListWindow(state, bodyBudget, usable);
+  const devices = state.status?.devices.slice(window.start, window.end) ?? [];
+  return (
+    <Box height={bodyBudget} flexDirection="column" flexShrink={0} overflow="hidden">
+      <Blank />
+      {state.statusLoading ? (
+        <Text color={color ? COLORS.muted : undefined}>Loading…</Text>
+      ) : !state.status ? (
+        <Text color={color ? COLORS.muted : undefined}>Devices unavailable.</Text>
+      ) : state.status.devices.length === 0 ? (
+        <Text color={color ? COLORS.muted : undefined}>No paired devices.</Text>
+      ) : (
+        <>
+          <DeviceHeading usable={usable} color={color} />
+          {devices.map((device, index) => {
+            const deviceIndex = window.start + index;
+            return (
+              <DeviceRow
+                key={device.id}
+                device={device}
+                selected={deviceIndex === window.selection}
+                usable={usable}
+                color={color}
+              />
+            );
+          })}
+        </>
+      )}
+    </Box>
+  );
+}
+
+function Overlay({ state, usable, color }: {
+  state: HudState;
+  usable: number;
+  color: boolean;
+}): React.ReactNode {
+  const overlay = overlayContent(state, usable);
+  if (!overlay) return null;
+  return (
+    <Box flexDirection="column" flexShrink={0}>
+      <Line usable={usable} color={color} />
+      {overlay.lines.map((line, index) => (
+        <Text
+          key={index}
+          bold={overlay.bold}
+          color={color ? overlay.tone : undefined}
+          wrap="truncate"
+        >
+          {line}
+        </Text>
+      ))}
+      {overlay.choices ? (
+        <Text color={color ? COLORS.muted : undefined} wrap="truncate">{overlay.choices}</Text>
+      ) : null}
+    </Box>
+  );
+}
+
+function FooterHintGroup({ hints, color }: {
+  hints: HudHint[];
+  color: boolean;
+}): React.ReactNode {
+  return hints.map((hint, index) => (
+    <React.Fragment key={`${hint.key}-${hint.label}`}>
+      {index > 0 ? <Text>   </Text> : null}
+      <Text bold color={color ? (hint.tone ?? COLORS.purpleReadable) : undefined}>
+        {hint.key}
+      </Text>
+      <Text color={color ? COLORS.muted : undefined}>
+        {` ${hint.label.padEnd(Math.max(hint.label.length, hint.labelWidth ?? 0))}`}
+      </Text>
+    </React.Fragment>
+  ));
+}
+
+function Footer({ rows, usable, color }: {
+  rows: HudFooterRow[];
+  usable: number;
+  color: boolean;
+}): React.ReactNode {
+  return (
+    <Box flexDirection="column" flexShrink={0}>
+      <Line usable={usable} color={color} />
+      {rows.map((row, rowIndex) => (
+        <Box key={rowIndex} width={usable}>
+          <Box flexShrink={0}>
+            <FooterHintGroup hints={row.left} color={color} />
+          </Box>
+          {row.right.length > 0 ? (
+            <Box flexGrow={1} justifyContent="flex-end" marginLeft={row.left.length > 0 ? 1 : 0}>
+              <FooterHintGroup hints={row.right} color={color} />
+            </Box>
+          ) : null}
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+export function HudScreen({ state, columns, rows, color = true, now = Date.now() }: {
+  state: HudState;
+  columns: number;
+  rows: number;
+  color?: boolean;
+  now?: number;
+}): React.ReactNode {
+  const margin = columns >= 24 ? 2 : 0;
+  const metrics = screenMetrics(state, columns, rows);
+  const inner = (
+    <Box width={metrics.usable} height={Math.max(6, rows)} flexDirection="column">
+      <Header
+        state={state}
+        usable={metrics.usable}
+        bodyBudget={metrics.bodyBudget}
+        color={color}
+      />
+      {state.view === "activity" ? (
+        <ActivityView
+          state={state}
+          usable={metrics.usable}
+          bodyBudget={metrics.bodyBudget}
+          color={color}
+          now={now}
+        />
+      ) : state.view === "activity-detail" ? (
+        <ActivityDetailView
+          state={state}
+          usable={metrics.usable}
+          bodyBudget={metrics.bodyBudget}
+          color={color}
+          now={now}
+        />
+      ) : state.view === "devices" ? (
+        <DevicesView
+          state={state}
+          usable={metrics.usable}
+          bodyBudget={metrics.bodyBudget}
+          color={color}
+        />
+      ) : (
+        <WorkspaceView
+          state={state}
+          usable={metrics.usable}
+          bodyBudget={metrics.bodyBudget}
+          color={color}
+          now={now}
+        />
+      )}
+      <Overlay state={state} usable={metrics.usable} color={color} />
+      <Footer rows={metrics.footerRows} usable={metrics.usable} color={color} />
+    </Box>
+  );
+  return (
+    <Box width={Math.max(8, columns)} height={Math.max(6, rows)} flexDirection="column">
+      {margin > 0 ? <Box marginLeft={margin}>{inner}</Box> : inner}
+    </Box>
+  );
+}
+
+export function renderHud(
+  state: HudState,
+  width = 80,
+  color = true,
+  height = 24,
+  now = Date.now(),
+): string {
+  const output = renderToString(
+    <HudScreen state={state} columns={width} rows={height} color={color} now={now} />,
+    { columns: width },
+  );
+  return color ? output : stripVTControlCharacters(output);
+}
+
+async function loadDevices(
+  store: HudStore,
+  actions: HudUiActions,
+  signal: AbortSignal,
+): Promise<void> {
+  const current = store.getSnapshot();
+  store.update((state) => ({
+    ...state,
+    view: "devices",
+    prompt: undefined,
+    notice: undefined,
+    noticeTone: undefined,
+  }));
+  if (current.statusLoading) return;
+  if (current.connection !== "connected" && current.connection !== "retrying") {
+    store.update((state) => ({
+      ...state,
+      notice: "Devices are available after Elix connects.",
+      noticeTone: "info",
+    }));
+    return;
+  }
+  store.update((state) => ({
+    ...state,
+    statusLoading: true,
+  }));
+  try {
+    const status = await actions.loadStatus(signal);
+    if (signal.aborted) return;
+    store.update((state) => ({
+      ...state,
+      status,
+      deviceSelection: Math.min(
+        state.deviceSelection,
+        Math.max(0, status.devices.length - 1),
+      ),
+      statusLoading: false,
+    }));
+  } catch (error) {
+    if (signal.aborted) return;
+    store.update((state) => ({
+      ...state,
+      statusLoading: false,
+      notice: error instanceof Error ? error.message : String(error),
+      noticeTone: "error",
+    }));
+  }
+}
+
+function beginAccessChange(
+  store: HudStore,
+  actions: HudUiActions,
+  accessProfile: WorkerAccessProfile,
+): void {
+  actions.changeAccessProfile(accessProfile);
+  store.update((state) => ({
+    ...state,
+    connection: "connecting",
+    pendingAccessProfile: accessProfile,
+    prompt: undefined,
+    notice: undefined,
+    noticeTone: undefined,
+  }));
+}
+
+function HudRuntime({ store, actions, signal, stop }: {
+  store: HudStore;
+  actions: HudUiActions;
+  signal: AbortSignal;
+  stop: () => void;
+}): React.ReactNode {
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const { columns, rows } = useWindowSize();
+  const [, setClock] = useState(0);
+
+  useEffect(() => {
+    if (
+      (state.view !== "activity" && state.view !== "activity-detail" && state.view !== "workspace") ||
+      state.activities.length === 0
+    ) return;
+    const hasWorkingActivity = state.activities.some((activity) => activity.state === "working");
+    const interval = hasWorkingActivity
+      ? ACTIVITY_LIVE_REFRESH_INTERVAL_MS
+      : ACTIVITY_IDLE_REFRESH_INTERVAL_MS;
+    const timer = setInterval(() => setClock((value) => value + 1), interval);
+    return () => clearInterval(timer);
+  }, [state.view, state.activities]);
+
+  useEffect(() => {
+    store.update((current) => {
+      let next = current;
+      const metrics = screenMetrics(current, columns, rows);
+      if (current.view === "activity-detail") {
+        const maxScroll = activityDetailMaxScroll(
+          current,
+          metrics.usable,
+          metrics.bodyBudget,
+          Date.now(),
+        );
+        if (current.activityDetailScroll > maxScroll) {
+          next = { ...next, activityDetailScroll: maxScroll };
+        }
+      }
+      if (current.prompt?.type === "revoke-confirm") {
+        const capacity = statusDeviceCapacity(current, metrics.bodyBudget, metrics.usable);
+        if (capacity === 0) {
+          next = {
+            ...next,
+            prompt: undefined,
+            notice: "Increase the terminal height to choose a device.",
+            noticeTone: "info",
+          };
+        }
+      }
+      return next;
+    });
+  }, [columns, rows, store]);
+
+  useInput((input, key) => {
+    const current = store.getSnapshot();
+    const value = input.toLowerCase();
+    if ((key.ctrl && value === "c") || value === "q") {
+      stop();
+      return;
+    }
+    if (current.busy) return;
+
+    if (current.prompt) {
+      if (key.escape || value === "n") {
+        store.update((state) => ({
+          ...state,
+          prompt: undefined,
+          notice: undefined,
+          noticeTone: undefined,
+        }));
+        return;
+      }
+      if (value !== "y") return;
+      if (current.prompt.type === "access-confirm") {
+        beginAccessChange(store, actions, current.prompt.accessProfile);
+        return;
+      }
+      const device = current.status?.devices[current.prompt.deviceIndex];
+      if (!device) return;
+      store.update((state) => ({
+        ...state,
+        busy: true,
+        busyMessage: `Revoking ${device.name}…`,
+        prompt: undefined,
+        notice: undefined,
+        noticeTone: undefined,
+      }));
+      void actions.revokeDevice(device.id, signal).then(async () => {
+        if (signal.aborted) return;
+        store.update((state) => ({ ...state, busy: false, busyMessage: undefined }));
+        await loadDevices(store, actions, signal);
+        if (signal.aborted) return;
+        store.update((state) => ({
+          ...state,
+          notice: `Revoked ${device.name}.`,
+          noticeTone: "success",
+        }));
+      }).catch((error: unknown) => {
+        if (signal.aborted) return;
+        store.update((state) => ({
+          ...state,
+          busy: false,
+          busyMessage: undefined,
+          notice: error instanceof Error ? error.message : String(error),
+          noticeTone: "error",
+        }));
+      });
+      return;
+    }
+
+    if (current.view === "activity-detail") {
+      if (key.upArrow || key.downArrow) {
+        const metrics = screenMetrics(current, columns, rows);
+        const maxScroll = activityDetailMaxScroll(
+          current,
+          metrics.usable,
+          metrics.bodyBudget,
+          Date.now(),
+        );
+        const activityDetailScroll = key.upArrow
+          ? Math.max(0, current.activityDetailScroll - 1)
+          : Math.min(maxScroll, current.activityDetailScroll + 1);
+        if (activityDetailScroll !== current.activityDetailScroll) {
+          store.update((state) => ({ ...state, activityDetailScroll }));
+        }
+        return;
+      }
+      if (key.escape || key.return || input === "\r" || input === "\n") {
+        store.update((state) => ({
+          ...state,
+          view: "activity",
+          activityDetailScroll: 0,
+          notice: undefined,
+        }));
+        return;
+      }
+    }
+    if (current.view === "activity") {
+      if (key.tab || input === "\t") {
+        store.update((state) => ({
+          ...state,
+          activityMode: state.activityMode === "compact" ? "detailed" : "compact",
+          notice: undefined,
+        }));
+        return;
+      }
+      if (key.escape && current.activitySelection) {
+        store.update((state) => ({
+          ...state,
+          activitySelection: undefined,
+          notice: undefined,
+        }));
+        return;
+      }
+      if (key.upArrow || key.downArrow) {
+        const metrics = screenMetrics(current, columns, rows);
+        if (current.activitySelection) {
+          const update = activitySelectionUpdate(
+            current,
+            metrics.bodyBudget,
+            key.upArrow ? -1 : 1,
+          );
+          if (update) {
+            store.update((state) => ({ ...state, ...update, notice: undefined }));
+          }
+        } else {
+          const update = activityPageUpdate(
+            current,
+            metrics.bodyBudget,
+            key.upArrow ? "older" : "newer",
+          );
+          if (update) {
+            store.update((state) => ({ ...state, ...update, notice: undefined }));
+          }
+        }
+        return;
+      }
+      if (key.return || input === "\r" || input === "\n") {
+        if (!current.activitySelection) {
+          const metrics = screenMetrics(current, columns, rows);
+          const activitySelection = activityCenterSelection(current, metrics.bodyBudget);
+          if (activitySelection) {
+            store.update((state) => ({
+              ...state,
+              activitySelection,
+              notice: undefined,
+            }));
+          }
+          return;
+        }
+        const selected = selectedActivity(current);
+        if (!selected) return;
+        store.update((state) => ({
+          ...state,
+          view: "activity-detail",
+          activityDetailScroll: 0,
+          notice: undefined,
+        }));
+        return;
+      }
+    }
+    if (current.view === "devices" && (key.upArrow || key.downArrow)) {
+      const total = current.status?.devices.length ?? 0;
+      const metrics = screenMetrics(current, columns, rows);
+      if (total === 0 || statusDeviceCapacity(current, metrics.bodyBudget, metrics.usable) === 0) {
+        return;
+      }
+      const selection = key.upArrow
+        ? Math.max(0, current.deviceSelection - 1)
+        : Math.min(total - 1, current.deviceSelection + 1);
+      if (selection !== current.deviceSelection) {
+        store.update((state) => ({ ...state, deviceSelection: selection, notice: undefined }));
+      }
+      return;
+    }
+    if (
+      current.view === "workspace" &&
+      current.connection === "connected" &&
+      current.accessProfile &&
+      !current.pendingAccessProfile &&
+      (key.leftArrow || key.rightArrow)
+    ) {
+      const direction = key.leftArrow ? -1 : 1;
+      const accessProfile = adjacentAccessProfile(current.accessProfile, direction);
+      if (!accessProfile) return;
+      if (direction < 0) {
+        beginAccessChange(store, actions, accessProfile);
+      } else {
+        store.update((state) => ({
+          ...state,
+          prompt: { type: "access-confirm", accessProfile },
+          notice: undefined,
+        }));
+      }
+      return;
+    }
+
+    if (key.escape) {
+      store.update((state) => ({ ...state, view: "workspace", notice: undefined }));
+      return;
+    }
+    if (value === "a") {
+      const preserveBrowsePage = current.view === "activity" || current.view === "activity-detail";
+      store.update((state) => ({
+        ...state,
+        view: "activity",
+        activitySelection: undefined,
+        activityBrowseAnchor: preserveBrowsePage ? state.activityBrowseAnchor : undefined,
+        activityDetailScroll: 0,
+        notice: undefined,
+      }));
+      return;
+    }
+    if (value === "w") {
+      store.update((state) => ({
+        ...state,
+        view: "workspace",
+        prompt: undefined,
+        notice: undefined,
+      }));
+      return;
+    }
+    if (value === "d") {
+      if (current.status) {
+        store.update((state) => ({
+          ...state,
+          view: "devices",
+          prompt: undefined,
+          notice: undefined,
+        }));
+      } else {
+        void loadDevices(store, actions, signal);
+      }
+      return;
+    }
+    if ((key.return || input === "\r" || input === "\n" || value === "r") && current.view === "devices") {
+      const count = current.status?.devices.length ?? 0;
+      if (count === 0) {
+        store.update((state) => ({
+          ...state,
+          notice: "There are no paired devices to revoke.",
+          noticeTone: "info",
+        }));
+        return;
+      }
+      const metrics = screenMetrics(current, columns, rows);
+      const capacity = statusDeviceCapacity(current, metrics.bodyBudget, metrics.usable);
+      const selection = Math.min(current.deviceSelection, count - 1);
+      store.update((state) => capacity === 0
+        ? {
+            ...state,
+            notice: "Increase the terminal height to choose a device.",
+            noticeTone: "info",
+          }
+        : {
+            ...state,
+            deviceSelection: selection,
+            prompt: { type: "revoke-confirm", deviceIndex: selection },
+            notice: undefined,
+            noticeTone: undefined,
+          });
+      return;
+    }
+  });
+
+  return (
+    <HudScreen
+      state={state}
+      columns={columns}
+      rows={rows}
+      color={!process.env.NO_COLOR}
+      now={Date.now()}
+    />
+  );
+}
+
+export async function runSessionHud(
+  actions: HudUiActions,
+  input: ReadStream = process.stdin,
+  output: WriteStream = process.stdout,
+): Promise<void> {
+  if (!input.isTTY || !output.isTTY) {
+    throw new Error(INTERACTIVE_TERMINAL_REQUIRED);
+  }
+
+  const controller = new AbortController();
+  const store = new HudStore(actions.workspace, actions.initialNotice);
+  let instance: ReturnType<typeof render> | undefined;
+
+  const stop = (): void => {
+    controller.abort();
+    instance?.unmount();
+  };
+  const stopFromSignal = (): void => stop();
+  process.once("SIGINT", stopFromSignal);
+  process.once("SIGTERM", stopFromSignal);
+
+  output.write(terminalTitleSequence(actions.workspaceLabel));
+  instance = render(
+    <HudRuntime
+      store={store}
+      actions={actions}
+      signal={controller.signal}
+      stop={stop}
+    />,
+    {
+      stdin: input,
+      stdout: output,
+      exitOnCtrlC: false,
+      patchConsole: false,
+      alternateScreen: true,
+      incrementalRendering: true,
+      interactive: true,
+      maxFps: 30,
+    },
+  );
+
+  const session = actions.run(controller.signal, (event) => store.event(event)).then(() => {
+    if (!controller.signal.aborted) {
+      store.update((state) => ({ ...state, connection: "disconnected" }));
+    }
+  }).catch((error: unknown) => {
+    if (!controller.signal.aborted) {
+      store.update((state) => ({
+        ...state,
+        connection: "error",
+        message: error instanceof Error ? error.message : String(error),
+      }));
+      instance?.unmount();
+    }
+    throw error;
+  });
+  void session.catch(() => undefined);
+
+  try {
+    await instance.waitUntilExit();
+    await session;
+  } finally {
+    controller.abort();
+    process.removeListener("SIGINT", stopFromSignal);
+    process.removeListener("SIGTERM", stopFromSignal);
+  }
+}

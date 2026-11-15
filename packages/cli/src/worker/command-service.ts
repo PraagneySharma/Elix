@@ -1,0 +1,822 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  containsRestrictedAuthenticationData,
+  DEFAULT_COMMAND_FAST_WAIT_MS,
+  DEFAULT_COMMAND_OUTPUT_RANGE_BYTES,
+  DEFAULT_COMMAND_TIMEOUT_MS,
+  MAX_COMMAND_OUTPUT_BYTES,
+  MAX_COMMAND_OUTPUT_RANGE_BYTES,
+  MAX_COMMAND_RETAINED_STREAM_BYTES,
+  MAX_COMMAND_FAST_WAIT_MS,
+  MAX_COMMAND_STATUS_WAIT_MS,
+  MAX_COMMAND_TIMEOUT_MS,
+  RESTRICTED_DATA_ERROR_CODE,
+  RESTRICTED_DATA_ERROR_MESSAGE,
+} from "@elix/protocol";
+import { BoundedBuffer } from "./bounded-buffer.js";
+import { ignoreProcessError, terminateProcessTree } from "./command-termination.js";
+import { WorkerError } from "./errors.js";
+import type { PathPolicy } from "./path-policy.js";
+
+export type CommandStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "canceled"
+  | "timed_out";
+
+export interface StartCommandOptions {
+  argv?: string[];
+  shellCommand?: string;
+  stdin?: string;
+  timeoutMs?: number;
+  waitMs?: number;
+}
+
+export type CommandOutputStream = "stdout" | "stderr";
+
+export interface CommandSnapshot {
+  commandId: string;
+  status: CommandStatus;
+  sequence: number;
+  startedAt: string;
+  finishedAt?: string;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  stdout?: string;
+  stderr?: string;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
+}
+
+export interface CommandOutputRange {
+  commandId: string;
+  stream: CommandOutputStream;
+  status: CommandStatus;
+  offset: number;
+  content: string;
+  nextOffset?: number;
+  retainedBytes: number;
+  totalBytes: number;
+  retentionTruncated: boolean;
+  complete: boolean;
+}
+
+interface CapturedStream {
+  head: BoundedBuffer;
+  tail: Buffer;
+  retained: BoundedBuffer;
+  totalBytes: number;
+  retentionTruncated: boolean;
+}
+
+interface RenderedStream {
+  content: string;
+  truncated: boolean;
+}
+
+const STREAM_HEAD_BYTES = Math.floor(MAX_COMMAND_OUTPUT_BYTES / 3);
+const STREAM_TAIL_BYTES = MAX_COMMAND_OUTPUT_BYTES - STREAM_HEAD_BYTES;
+const RESTRICTED_SCAN_TAIL_BYTES = 1024;
+const COMMAND_RECORD_RETENTION_MS = 5 * 60 * 1000;
+const MAX_RETAINED_COMMAND_RECORDS = 8;
+const MAX_CONCURRENT_COMMANDS = 4;
+const COMMAND_CLEANUP_TIMEOUT_MS = 4000;
+const COMMAND_CLEANUP_CONFIRMATION_MS = 8000;
+
+interface CommandRecord {
+  id: string;
+  child: ChildProcessWithoutNullStreams;
+  status: CommandStatus;
+  sequence: number;
+  changeWaiters: Set<() => void>;
+  startedAt: number;
+  finishedAt?: number;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  stdout: CapturedStream;
+  stderr: CapturedStream;
+  stdoutScanTail: Buffer;
+  stderrScanTail: Buffer;
+  restrictedDataDetected: boolean;
+  completion: Promise<void>;
+  complete: () => void;
+  closed: Promise<void>;
+  observeClose: () => void;
+  cleanup?: Promise<void>;
+  cleanupFailed: boolean;
+  stop: () => void;
+  disposeObservers: () => void;
+  timeout?: NodeJS.Timeout;
+}
+
+function restrictedDataError(): WorkerError {
+  return new WorkerError(
+    RESTRICTED_DATA_ERROR_CODE,
+    RESTRICTED_DATA_ERROR_MESSAGE,
+  );
+}
+
+function scanOutputChunk(
+  previousTail: Buffer,
+  chunk: Buffer,
+): { detected: boolean; tail: Buffer } {
+  const combined = previousTail.byteLength === 0
+    ? chunk
+    : Buffer.concat([previousTail, chunk]);
+  const tail = combined.byteLength <= RESTRICTED_SCAN_TAIL_BYTES
+    ? Buffer.from(combined)
+    : Buffer.from(
+        combined.subarray(combined.byteLength - RESTRICTED_SCAN_TAIL_BYTES),
+      );
+  return {
+    detected: containsRestrictedAuthenticationData(combined.toString("utf8")),
+    tail,
+  };
+}
+
+function markRestrictedData(record: CommandRecord): void {
+  if (record.restrictedDataDetected) return;
+  record.restrictedDataDetected = true;
+  record.stdout = emptyCapture();
+  record.stderr = emptyCapture();
+  record.stdoutScanTail = Buffer.alloc(0);
+  record.stderrScanTail = Buffer.alloc(0);
+  if (record.status === "running") {
+    record.stop();
+  }
+  markChanged(record);
+}
+
+function recordCommandOutput(
+  record: CommandRecord,
+  streamName: CommandOutputStream,
+  chunk: Buffer,
+): void {
+  if (record.restrictedDataDetected || chunk.byteLength === 0) return;
+  const tailName = streamName === "stdout" ? "stdoutScanTail" : "stderrScanTail";
+  const scan = scanOutputChunk(record[tailName], chunk);
+  record[tailName] = scan.tail;
+  if (scan.detected) {
+    markRestrictedData(record);
+    return;
+  }
+  if (capture(record, record[streamName], chunk)) markChanged(record);
+}
+
+function appendTail(existing: Buffer, chunk: Buffer): Buffer {
+  if (chunk.byteLength >= STREAM_TAIL_BYTES) {
+    return Buffer.from(chunk.subarray(chunk.byteLength - STREAM_TAIL_BYTES));
+  }
+  const combined = existing.byteLength === 0
+    ? chunk
+    : Buffer.concat([existing, chunk]);
+  return combined.byteLength <= STREAM_TAIL_BYTES
+    ? combined
+    : combined.subarray(combined.byteLength - STREAM_TAIL_BYTES);
+}
+
+function capture(_record: CommandRecord, stream: CapturedStream, chunk: Buffer): boolean {
+  if (chunk.byteLength === 0) return false;
+  stream.totalBytes += chunk.byteLength;
+  if (stream.retained.append(chunk) < chunk.byteLength) {
+    stream.retentionTruncated = true;
+  }
+  const offset = stream.head.append(chunk);
+  if (offset < chunk.byteLength) {
+    stream.tail = appendTail(stream.tail, chunk.subarray(offset));
+  }
+  return true;
+}
+
+function markChanged(record: CommandRecord): void {
+  record.sequence += 1;
+  const waiters = [...record.changeWaiters];
+  record.changeWaiters.clear();
+  for (const waiter of waiters) waiter();
+}
+
+async function waitForChange(
+  record: CommandRecord,
+  afterSequence: number | undefined,
+  waitMs: number,
+): Promise<void> {
+  const ready = (): boolean => record.status !== "running" || record.cleanupFailed ||
+    (afterSequence !== undefined && record.sequence > afterSequence);
+  if (ready() || waitMs === 0) {
+    return;
+  }
+  let changed!: () => void;
+  const change = new Promise<void>((resolve) => {
+    changed = () => {
+      if (ready()) resolve();
+      else record.changeWaiters.add(changed);
+    };
+    record.changeWaiters.add(changed);
+  });
+  const waitController = new AbortController();
+  try {
+    await Promise.race([
+      change,
+      delay(waitMs, undefined, { signal: waitController.signal }),
+    ]);
+  } finally {
+    record.changeWaiters.delete(changed);
+    waitController.abort();
+  }
+}
+
+function emptyCapture(): CapturedStream {
+  return {
+    head: new BoundedBuffer(STREAM_HEAD_BYTES),
+    tail: Buffer.alloc(0),
+    retained: new BoundedBuffer(MAX_COMMAND_RETAINED_STREAM_BYTES),
+    totalBytes: 0,
+    retentionTruncated: false,
+  };
+}
+
+function retainedBytes(stream: CapturedStream, complete: boolean): number {
+  const head = stream.head.toBuffer();
+  const retained = Buffer.concat([head, stream.tail]);
+  const content = stream.totalBytes <= MAX_COMMAND_OUTPUT_BYTES
+    ? (
+      complete
+        ? retained.toString("utf8")
+        : new StringDecoder("utf8").write(retained)
+    )
+    : safePrefix(head) + safeSuffix(stream.tail);
+  return Math.min(Buffer.byteLength(content), MAX_COMMAND_OUTPUT_BYTES);
+}
+
+function safePrefix(buffer: Buffer): string {
+  return new StringDecoder("utf8").write(buffer);
+}
+
+function safeSuffix(buffer: Buffer): string {
+  let start = 0;
+  while (
+    start < buffer.byteLength &&
+    (buffer[start]! & 0b1100_0000) === 0b1000_0000
+  ) {
+    start += 1;
+  }
+  return new StringDecoder("utf8").write(buffer.subarray(start));
+}
+
+function utf8PrefixWithinBudget(value: string, budget: number): string {
+  let used = 0;
+  let end = 0;
+  for (const character of value) {
+    const bytes = Buffer.byteLength(character);
+    if (used + bytes > budget) break;
+    used += bytes;
+    end += character.length;
+  }
+  return value.slice(0, end);
+}
+
+function utf8SuffixWithinBudget(value: string, budget: number): string {
+  const characters = Array.from(value);
+  let used = 0;
+  let start = characters.length;
+  while (start > 0) {
+    const bytes = Buffer.byteLength(characters[start - 1]!);
+    if (used + bytes > budget) break;
+    used += bytes;
+    start -= 1;
+  }
+  return characters.slice(start).join("");
+}
+
+function isUtf8Continuation(byte: number | undefined): boolean {
+  return byte !== undefined && (byte & 0b1100_0000) === 0b1000_0000;
+}
+
+function utf8SequenceBytes(byte: number): number {
+  if ((byte & 0b1000_0000) === 0) return 1;
+  if ((byte & 0b1110_0000) === 0b1100_0000) return 2;
+  if ((byte & 0b1111_0000) === 0b1110_0000) return 3;
+  if ((byte & 0b1111_1000) === 0b1111_0000) return 4;
+  return 1;
+}
+
+function retainedRange(
+  stream: CapturedStream,
+  requestedOffset: number,
+  maxBytes: number,
+): { offset: number; content: string; nextOffset?: number } {
+  const retained = stream.retained.toBuffer();
+  let offset = requestedOffset;
+  while (offset < retained.byteLength && isUtf8Continuation(retained[offset])) {
+    offset += 1;
+  }
+  if (offset >= retained.byteLength) {
+    return { offset, content: "" };
+  }
+
+  let end = Math.min(retained.byteLength, offset + maxBytes);
+  if (end < retained.byteLength) {
+    while (end > offset && isUtf8Continuation(retained[end])) end -= 1;
+  }
+  if (end > offset) {
+    let lead = end - 1;
+    while (lead > offset && isUtf8Continuation(retained[lead])) lead -= 1;
+    const expected = utf8SequenceBytes(retained[lead]!);
+    if (expected > 1 && end - lead < expected) end = lead;
+  }
+  if (end <= offset) {
+    end = Math.min(retained.byteLength, offset + maxBytes);
+  }
+  return {
+    offset,
+    content: retained.subarray(offset, end).toString("utf8"),
+    ...(end < retained.byteLength ? { nextOffset: end } : {}),
+  };
+}
+
+function renderStream(
+  stream: CapturedStream,
+  budget: number,
+  complete: boolean,
+): RenderedStream {
+  if (budget <= 0 || stream.totalBytes === 0) {
+    return { content: "", truncated: stream.totalBytes > 0 };
+  }
+  const head = stream.head.toBuffer();
+  const retained = Buffer.concat([head, stream.tail]);
+  if (stream.totalBytes <= budget) {
+    const content = complete
+      ? retained.toString("utf8")
+      : new StringDecoder("utf8").write(retained);
+    if (Buffer.byteLength(content) <= budget) {
+      return { content, truncated: false };
+    }
+    const prefixBudget = Math.floor(budget / 3);
+    return {
+      content:
+        utf8PrefixWithinBudget(content, prefixBudget) +
+        utf8SuffixWithinBudget(content, budget - prefixBudget),
+      truncated: true,
+    };
+  }
+
+  const headBudget = Math.min(head.byteLength, Math.floor(budget / 3));
+  const tailBudget = Math.min(stream.tail.byteLength, budget - headBudget);
+  const remaining = budget - headBudget - tailBudget;
+  const extraHead = Math.min(remaining, head.byteLength - headBudget);
+  const prefixBudget = headBudget + extraHead;
+  const prefix = head.subarray(0, headBudget + extraHead);
+  const suffix = stream.tail.subarray(stream.tail.byteLength - tailBudget);
+  return {
+    content:
+      utf8PrefixWithinBudget(safePrefix(prefix), prefixBudget) +
+      utf8SuffixWithinBudget(safeSuffix(suffix), tailBudget),
+    truncated: true,
+  };
+}
+
+function renderOutput(
+  stdout: CapturedStream,
+  stderr: CapturedStream,
+  complete: boolean,
+): { stdout: RenderedStream; stderr: RenderedStream } {
+  const half = Math.floor(MAX_COMMAND_OUTPUT_BYTES / 2);
+  const stdoutAvailable = retainedBytes(stdout, complete);
+  const stderrAvailable = retainedBytes(stderr, complete);
+  let stdoutBudget = Math.min(stdoutAvailable, half);
+  let stderrBudget = Math.min(stderrAvailable, half);
+  let remaining = MAX_COMMAND_OUTPUT_BYTES - stdoutBudget - stderrBudget;
+
+  const stderrExtra = Math.min(remaining, stderrAvailable - stderrBudget);
+  stderrBudget += stderrExtra;
+  remaining -= stderrExtra;
+  stdoutBudget += Math.min(remaining, stdoutAvailable - stdoutBudget);
+
+  return {
+    stdout: renderStream(stdout, stdoutBudget, complete),
+    stderr: renderStream(stderr, stderrBudget, complete),
+  };
+}
+
+function isWindowsCommandShim(file: string): boolean {
+  return /\.(?:cmd|bat)$/i.test(file);
+}
+
+function shellInvocation(command: string): { file: string; args: string[] } {
+  if (process.platform === "win32") {
+    const file = process.env.ELIX_WINDOWS_SHELL ?? "powershell.exe";
+    return {
+      file,
+      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+    };
+  }
+  return { file: process.env.SHELL ?? "/bin/sh", args: ["-lc", command] };
+}
+
+export class CommandService {
+  readonly #commands = new Map<string, CommandRecord>();
+  #shuttingDown = false;
+  readonly #cleanupFailures = new Set<string>();
+
+  constructor(
+    readonly policy: PathPolicy,
+    private readonly terminate = terminateProcessTree,
+  ) {}
+
+  #finish(record: CommandRecord, status: CommandStatus): void {
+    if (record.status !== "running") return;
+    if (record.timeout) clearTimeout(record.timeout);
+    record.status = status;
+    record.finishedAt = Date.now();
+    record.stdoutScanTail = Buffer.alloc(0);
+    record.stderrScanTail = Buffer.alloc(0);
+    record.disposeObservers();
+    markChanged(record);
+    record.complete();
+    this.#scheduleDeletion(record.id);
+  }
+
+  #cleanup(
+    record: CommandRecord,
+    status: "canceled" | "timed_out" | "failed",
+  ): Promise<void> {
+    if (record.cleanup) return record.cleanup;
+    if (record.status !== "running") return Promise.resolve();
+    if (record.timeout) clearTimeout(record.timeout);
+    record.cleanup = Promise.resolve().then(async () => {
+      if (record.status !== "running") return;
+      let timer!: NodeJS.Timeout;
+      let expired = false;
+      let terminationPending = true;
+      const terminated = Promise.resolve().then(() => this.terminate(record.child))
+        .then(() => {
+          terminationPending = false;
+          return record.closed;
+        });
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => {
+            expired = true;
+            reject(new Error("Command cleanup timed out."));
+          },
+          COMMAND_CLEANUP_TIMEOUT_MS,
+        );
+      });
+      try {
+        await Promise.race([terminated, deadline]);
+        this.#finish(record, status);
+      } catch {
+        record.cleanupFailed = true;
+        this.#cleanupFailures.add(record.id);
+        if (!expired || !terminationPending) {
+          this.#finish(record, "failed");
+          return;
+        }
+        markChanged(record);
+        let confirmationTimer!: NodeJS.Timeout;
+        const confirmationDeadline = new Promise<never>((_, reject) => {
+          confirmationTimer = setTimeout(() => reject(new Error("Cleanup remained unconfirmed.")),
+            COMMAND_CLEANUP_CONFIRMATION_MS);
+        });
+        void Promise.race([terminated, confirmationDeadline]).then(() => {
+          record.cleanupFailed = false;
+          this.#cleanupFailures.delete(record.id);
+          this.#finish(record, status);
+        }, () => {
+          this.#finish(record, "failed");
+        }).finally(() => clearTimeout(confirmationTimer));
+      } finally {
+        clearTimeout(timer);
+      }
+    });
+    return record.cleanup;
+  }
+
+  #pruneRetainedCommands(): void {
+    while (this.#commands.size >= MAX_RETAINED_COMMAND_RECORDS) {
+      const oldestTerminal = [...this.#commands].find(
+        ([, record]) => record.status !== "running",
+      );
+      if (!oldestTerminal) return;
+      clearTimeout(oldestTerminal[1].timeout);
+      this.#commands.delete(oldestTerminal[0]);
+    }
+  }
+
+  #scheduleDeletion(commandId: string): void {
+    const record = this.#commands.get(commandId);
+    if (!record) return;
+    record.timeout = setTimeout(
+      () => this.#commands.delete(commandId),
+      COMMAND_RECORD_RETENTION_MS,
+    );
+    record.timeout.unref();
+  }
+
+  async start(options: StartCommandOptions): Promise<CommandSnapshot> {
+    if (this.#cleanupFailures.size) throw new WorkerError("command_cleanup_failed");
+    if (this.#shuttingDown) {
+      throw new WorkerError("worker_shutting_down", "The worker is shutting down.");
+    }
+    const running = [...this.#commands.values()].filter((record) => record.status === "running");
+    if (running.length >= MAX_CONCURRENT_COMMANDS) {
+      throw new WorkerError("command_busy", "The workspace has reached its concurrent command limit.");
+    }
+    if ((options.argv ? 1 : 0) + (options.shellCommand ? 1 : 0) !== 1) {
+      throw new WorkerError(
+        "invalid_command",
+        "Exactly one of argv or shellCommand is required.",
+      );
+    }
+    if (
+      process.platform === "win32" &&
+      options.argv &&
+      isWindowsCommandShim(options.argv[0]!)
+    ) {
+      throw new WorkerError(
+        "windows_command_shim",
+        "Windows .cmd and .bat command shims must be run through shellCommand with the explicit shim filename.",
+      );
+    }
+    const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_COMMAND_TIMEOUT_MS) {
+      throw new WorkerError(
+        "invalid_timeout",
+        "Command timeout must be between 1 millisecond and 60 minutes.",
+      );
+    }
+    const waitMs = options.waitMs ?? DEFAULT_COMMAND_FAST_WAIT_MS;
+    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > MAX_COMMAND_FAST_WAIT_MS) {
+      throw new WorkerError(
+        "invalid_wait",
+        "Command start wait must be between 0 and 5 seconds.",
+      );
+    }
+    if (
+      containsRestrictedAuthenticationData({
+        argv: options.argv,
+        shellCommand: options.shellCommand,
+        stdin: options.stdin,
+      })
+    ) {
+      throw restrictedDataError();
+    }
+    const cwd = this.policy.root;
+    const invocation = options.argv
+      ? { file: options.argv[0]!, args: options.argv.slice(1) }
+      : shellInvocation(options.shellCommand!);
+
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(invocation.file, invocation.args, {
+        cwd,
+        env: process.env,
+        detached: process.platform !== "win32",
+        stdio: "pipe",
+        windowsHide: true,
+      });
+    } catch {
+      throw new WorkerError(
+        "command_spawn_failed",
+        "The command could not be started.",
+      );
+    }
+    let complete!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    let observeClose!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      observeClose = resolve;
+    });
+    const id = randomUUID();
+    const record: CommandRecord = {
+      id,
+      child,
+      status: "running",
+      sequence: 0,
+      changeWaiters: new Set(),
+      startedAt: Date.now(),
+      stdout: emptyCapture(),
+      stderr: emptyCapture(),
+      stdoutScanTail: Buffer.alloc(0),
+      stderrScanTail: Buffer.alloc(0),
+      restrictedDataDetected: false,
+      completion,
+      complete,
+      closed,
+      observeClose,
+      cleanupFailed: false,
+      stop: () => {
+        void this.#cleanup(record, "canceled");
+      },
+      disposeObservers: () => {
+        child.stdout.removeListener("data", onStdout);
+        child.stderr.removeListener("data", onStderr);
+        child.stdout.removeListener("error", onError);
+        child.stderr.removeListener("error", onError);
+        child.removeListener("error", onError);
+        child.removeListener("close", onClose);
+        child.on("error", ignoreProcessError);
+        child.stdin.removeListener("error", ignoreProcessError);
+        for (const stream of [child.stdin, child.stdout, child.stderr]) {
+          stream.on("error", ignoreProcessError);
+          stream.destroy();
+        }
+        child.unref();
+      },
+    };
+    record.timeout = setTimeout(() => {
+      if (record.status !== "running") return;
+      void this.#cleanup(record, "timed_out");
+    }, timeoutMs);
+    record.timeout.unref();
+    this.#pruneRetainedCommands();
+    this.#commands.set(id, record);
+
+    const onStdout = (chunk: Buffer) => {
+      recordCommandOutput(record, "stdout", chunk);
+    };
+    const onStderr = (chunk: Buffer) => {
+      recordCommandOutput(record, "stderr", chunk);
+    };
+    const onError = (error: Error) => {
+      if (record.status !== "running") return;
+      if (child.pid) {
+        void this.#cleanup(record, "failed");
+      } else {
+        record.observeClose();
+        recordCommandOutput(record, "stderr", Buffer.from(error.message, "utf8"));
+        this.#finish(record, "failed");
+      }
+    };
+    const onClose = (exitCode: number | null, signal: NodeJS.Signals | null) => {
+      if (record.status !== "running") return;
+      record.exitCode = exitCode;
+      record.signal = signal;
+      record.observeClose();
+      if (!record.cleanup) {
+        this.#finish(record, exitCode === 0 ? "succeeded" : "failed");
+      }
+    };
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
+    child.stdout.on("error", onError);
+    child.stderr.on("error", onError);
+    child.stdin.on("error", ignoreProcessError);
+    child.on("error", onError);
+    child.once("close", onClose);
+    if (options.stdin !== undefined) child.stdin.end(options.stdin);
+    else child.stdin.end();
+
+    await new Promise<void>((resolve, reject) => {
+      const onSpawn = () => {
+        child.removeListener("error", onSpawnError);
+        resolve();
+      };
+      const onSpawnError = (error: Error) => {
+        child.removeListener("spawn", onSpawn);
+        reject(error);
+      };
+      child.once("spawn", onSpawn);
+      child.once("error", onSpawnError);
+    }).catch(async () => {
+      await record.completion;
+      if (record.restrictedDataDetected) throw restrictedDataError();
+      throw new WorkerError(
+        "command_spawn_failed",
+        "The command could not be started.",
+      );
+    });
+    await waitForChange(record, undefined, waitMs);
+    return this.snapshot(record);
+  }
+
+  async get(
+    commandId: string,
+    waitMs = 0,
+    afterSequence?: number,
+  ): Promise<CommandSnapshot> {
+    const record = this.#commands.get(commandId);
+    if (!record) throw new WorkerError("command_not_found", "The command was not found.");
+    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > MAX_COMMAND_STATUS_WAIT_MS) {
+      throw new WorkerError("invalid_wait", "Status wait must be between 0 and 15 seconds.");
+    }
+    if (
+      afterSequence !== undefined &&
+      (!Number.isInteger(afterSequence) ||
+        afterSequence < 0 ||
+        afterSequence > record.sequence)
+    ) {
+      throw new WorkerError(
+        "invalid_sequence",
+        "The command sequence is invalid for this command.",
+      );
+    }
+    await waitForChange(record, afterSequence, waitMs);
+    return this.snapshot(record);
+  }
+
+  async readOutput(
+    commandId: string,
+    streamName: CommandOutputStream,
+    offset = 0,
+    maxBytes = DEFAULT_COMMAND_OUTPUT_RANGE_BYTES,
+  ): Promise<CommandOutputRange> {
+    const record = this.#commands.get(commandId);
+    if (!record) throw new WorkerError("command_not_found", "The command was not found.");
+    if (streamName !== "stdout" && streamName !== "stderr") {
+      throw new WorkerError(
+        "invalid_output_stream",
+        "Command output stream must be stdout or stderr.",
+      );
+    }
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new WorkerError(
+        "invalid_output_offset",
+        "Command output offset must be a non-negative integer.",
+      );
+    }
+    if (
+      !Number.isInteger(maxBytes) ||
+      maxBytes < 4 ||
+      maxBytes > MAX_COMMAND_OUTPUT_RANGE_BYTES
+    ) {
+      throw new WorkerError(
+        "invalid_output_range",
+        "Command output range must be between 4 and 65536 source bytes.",
+      );
+    }
+    if (record.cleanupFailed) throw new WorkerError("command_cleanup_failed");
+    if (record.restrictedDataDetected) throw restrictedDataError();
+    const stream = record[streamName];
+    if (offset > stream.retained.byteLength) {
+      throw new WorkerError(
+        "output_offset_out_of_range",
+        "The command output offset exceeds the retained stream length.",
+      );
+    }
+    const range = retainedRange(stream, offset, maxBytes);
+    if (containsRestrictedAuthenticationData(range.content)) {
+      markRestrictedData(record);
+      throw restrictedDataError();
+    }
+    return {
+      commandId,
+      stream: streamName,
+      status: record.status,
+      offset: range.offset,
+      content: range.content,
+      ...(range.nextOffset === undefined ? {} : { nextOffset: range.nextOffset }),
+      retainedBytes: stream.retained.byteLength,
+      totalBytes: stream.totalBytes,
+      retentionTruncated: stream.retentionTruncated,
+      complete: record.status !== "running",
+    };
+  }
+
+  async cancel(commandId: string): Promise<CommandSnapshot> {
+    const record = this.#commands.get(commandId);
+    if (!record) throw new WorkerError("command_not_found", "The command was not found.");
+    if (record.status !== "running") return this.snapshot(record);
+    await this.#cleanup(record, "canceled");
+    return this.snapshot(record);
+  }
+
+  async shutdown(): Promise<void> {
+    this.#shuttingDown = true;
+    const running = [...this.#commands.values()].filter((record) => record.status === "running");
+    await Promise.all(running.map((record) => this.#cleanup(record, "canceled")));
+    if (this.#cleanupFailures.size) throw new WorkerError("command_cleanup_failed");
+  }
+
+  private snapshot(record: CommandRecord): CommandSnapshot {
+    if (record.cleanupFailed) throw new WorkerError("command_cleanup_failed");
+    if (record.restrictedDataDetected) throw restrictedDataError();
+    const output = renderOutput(
+      record.stdout,
+      record.stderr,
+      record.status !== "running",
+    );
+    const base: CommandSnapshot = {
+      commandId: record.id,
+      status: record.status,
+      sequence: record.sequence,
+      startedAt: new Date(record.startedAt).toISOString(),
+      stdout: output.stdout.content,
+      stderr: output.stderr.content,
+      stdoutTruncated: output.stdout.truncated,
+      stderrTruncated: output.stderr.truncated,
+    };
+    if (record.finishedAt !== undefined) {
+      base.finishedAt = new Date(record.finishedAt).toISOString();
+      base.exitCode = record.exitCode ?? null;
+      base.signal = record.signal ?? null;
+    }
+    return base;
+  }
+}
